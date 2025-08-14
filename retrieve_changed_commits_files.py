@@ -291,6 +291,7 @@ def main():
                 # if content:
                 #     print(f"Content preview (first 200 chars):")
                 #     print(content[:200] + "..." if len(content) > 200 else content)
+        
     else:
         print("No matching files found")
 
