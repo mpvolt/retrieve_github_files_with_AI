@@ -196,7 +196,7 @@ def extract_function_names(blob_url: str, api_key: Optional[str] = None) -> List
 
 
 if __name__ == "__main__":
-    blob_url = "https://github.com/Brahma-fi/protected_moonshots/blob/24371443334476878fd5dece3c2905352a618e27/contracts/Vault.sol"
+    blob_url = "https://github.com/PotLock/grantpicks/blob/69f785ed988d4aeefc4a041047bb5e4d200c6967/stellar/contract/lists/src/internal.rs"
     API_KEY = os.getenv('GITHUB_API_KEY')
 
     functions = extract_function_names(blob_url, API_KEY)

@@ -262,7 +262,7 @@ if __name__ == "__main__":
     else:
         # Example: Get all smart contract files with their content
         results = get_smart_contracts(
-            github_url="https://github.com/get-smooth/crypto-lib/tree/f40942c2bdff620d9fb1935054c8d0b21e6f17b1",
+            github_url="https://github.com/PotLock/grantpicks/blob/69f785ed988d4aeefc4a041047bb5e4d200c6967/stellar/contract/lists/src/internal.rs",
             api_key=API_KEY
         )
         
