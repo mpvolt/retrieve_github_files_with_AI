@@ -8,10 +8,17 @@ import shutil
 import subprocess
 import tempfile
 from urllib.parse import urlparse
+from retrieve_all_smart_contract_files import get_smart_contracts
+from retrieve_changed_commits_files import handle_commit_files_via_api
+from retrieve_changed_pull_request_files import handle_pr_files_via_api
+from retrieve_changed_compare_files import handle_compare_files_via_api
+from retrieve_all_smart_contract_functions import extract_function_names
+
 
 SMART_CONTRACT_EXTENSIONS = (
-        '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.ts', '.js'
+        '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
     )
+API_KEY = os.getenv('GITHUB_API_KEY')
 
 def extract_string_values(obj):
     """Recursively extracts all string values from a JSON object (dict or list)."""
@@ -31,89 +38,28 @@ def extract_string_values(obj):
     return strings
 
 
-def extract_function_names(file_content, file_extension):
-    """Extract function names from different smart contract file types."""
-    function_names = []
-    
-    if file_extension == '.sol':
-        # Solidity function patterns
-        patterns = [
-            r'function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'modifier\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'event\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'constructor\s*\(',  # constructor doesn't have a name but we'll capture it
-        ]
-    elif file_extension == '.vy':
-        # Vyper function patterns
-        patterns = [
-            r'@external\s*\ndef\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'@internal\s*\ndef\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-        ]
-    elif file_extension == '.rs':
-        # Rust function patterns
-        patterns = [
-            r'fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'pub\s+fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-        ]
-    elif file_extension == '.move':
-        # Move function patterns
-        patterns = [
-            r'fun\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'public\s+fun\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'public\s+entry\s+fun\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-        ]
-    elif file_extension in ['.ts', '.js']:
-        # TypeScript/JavaScript function patterns
-        patterns = [
-            r'function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(',
-            r'const\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*\(',
-            r'let\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*\(',
-            r'([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:\s*\([^)]*\)\s*=>\s*',
-        ]
-    elif file_extension in ['.cairo', '.fc', '.func']:
-        # Cairo/FunC function patterns (basic)
-        patterns = [
-            r'func\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-            r'fun\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',
-        ]
-    else:
-        patterns = []
-    
-    for pattern in patterns:
-        matches = re.finditer(pattern, file_content, re.MULTILINE | re.IGNORECASE)
-        for match in matches:
-            if match.groups():
-                function_names.append(match.group(1))
-            elif 'constructor' in pattern:
-                function_names.append('constructor')
-    
-    return function_names
-
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Find smart contract files matching filenames or function names from JSON report.")
-    parser.add_argument("json_file", help="Path to the JSON vulnerability report file.")
-    args = parser.parse_args()
-
-    # Load JSON file
+def get_relevant_files(json_file):
     try:
-        with open(args.json_file, "r", encoding="utf-8") as f:
+        with open(json_file, "r", encoding="utf-8") as f:
             reports = json.load(f)  # could be a list
     except (IOError, json.JSONDecodeError) as e:
         print(f"Error reading JSON file: {e}")
-        return
+        return {}
 
     if isinstance(reports, dict):
         reports = [reports]  # wrap single object in a list
 
-    all_matches = []
+    # Dictionary to store results with title as key
+    results_dict = {}
 
     for i, report in enumerate(reports):
         print(f"\n{'='*50}")
-        print(f"Processing report {i+1}: {report.get('title', 'Untitled')}")
+        report_title = report.get('title', f'Untitled_Report_{i+1}')
+        print(f"Processing report {i+1}: {report_title}")
         print(f"{'='*50}")
+        
+        # Use a set to track unique file URLs and prevent duplicates for this report
+        relevant_files_set = set()
         
         # Make a copy to avoid modifying the original
         report_copy = report.copy()
@@ -122,6 +68,7 @@ def main():
 
         if not source_url and not fix_url:
             print("Error: JSON must contain either 'source_code_url' or 'fix_commit_url'.")
+            results_dict[report_title] = []
             continue
 
         # Only use title, description, and files fields for search terms
@@ -132,43 +79,105 @@ def main():
             search_data['description'] = report['description'] 
         if 'files' in report:
             search_data['files'] = report['files']
+        if 'broken_code_snippets' in report:
+            search_data['broken_code_snippets'] = report['broken_code_snippets']
             
         search_json_str = json.dumps(search_data)
-
-        if source_url:
-            print(f"\nSearching source code at: {source_url}")
-            matches = find_matching_files(search_json_str, source_url, 'source')
-            all_matches.extend(matches)
-            
-        if fix_url:
-            print(f"\nSearching fix commit at: {fix_url}")
-            matches = find_matching_files(search_json_str, fix_url, 'fix')
-            all_matches.extend(matches)
-
-    # --- Output all results ---
-    print(f"\n{'='*60}")
-    print("SUMMARY OF ALL MATCHING FILES")
-    print(f"{'='*60}")
-    
-    if not all_matches:
-        print("No matching files found.")
-    else:
-        print(f"Found {len(all_matches)} matching files:")
-        print()
         
-        for match in all_matches:
-            print(f"File: {match['file_path']} ({match['url_type']}) [Score: {match['score']}]")
-            if match.get('commit_specific'):
-                print(f"      ^ File was changed in this specific commit/PR")
-            print(f"URL:  {match['file_url']}")
-            
-            if match['filename_matches']:
-                print(f"Filename matches: {', '.join(match['filename_matches'])}")
-            
-            if match['function_matches']:
-                print(f"Function matches: {', '.join(match['function_matches'])}")
-            
-            print("-" * 40)
+        # Convert single URLs to lists for uniform processing
+        source_urls = source_url if isinstance(source_url, list) else [source_url] if source_url else []
+        fix_urls = fix_url if isinstance(fix_url, list) else [fix_url] if fix_url else []
+
+        #If we have a fix_commit_url field, we don't check source commit
+        #Otherwise, we check the source commits
+        if not fix_urls:
+            # Process all source URLs
+            # Retrieve the most recent versions of all files, determine which are relevant semantically
+            for url in source_urls:
+                print(f"\nSearching source code at: {url}")
+                new_tree = None
+                
+                if 'commit' in url:
+                    print("Processing commit url, retrieving new tree and relevant smart contract files")
+                    result = handle_commit_files_via_api(url)
+                    new_tree = result['newer_tree_url']
+                elif 'pull' in url:
+                    print("Processing pull url, retrieving new tree and relevant smart contract files")
+                    result = handle_pr_files_via_api(url)
+                    new_tree = result['head_tree_info']
+                elif 'compare' in url:
+                    print("Processing compare url, retrieving new tree and relevant smart contract files")
+                    result = handle_compare_files_via_api(url)
+                    new_tree = result['head_tree_url']
+                elif 'tree' in url:
+                    print("Already a tree, retrieving smart contract files")
+                    new_tree = url
+                elif 'blob' in url:
+                    print("Blob detected, doing nothing")
+                    relevant_files_set.add(url)
+
+                if new_tree:
+                    #Can't determine relevant files directly from source url
+                    #Need to get all smart contract files and check semantics
+                    results = get_smart_contracts(github_url=new_tree, api_key=API_KEY)
+                    for file in results['files']:
+                        relevant_files_set.add(file['blob_url'])
+
+        else:
+        # Process all fix URLs
+        # Retrieve only the files that changed (if not tree), determine which are relevant semantically
+
+            for url in fix_urls:
+                print(f"\nSearching fix commit at: {url}")
+                
+                if 'commit' in url:
+                    print("Processing commit url, retrieving changed files")
+                    result = handle_commit_files_via_api(url)
+                    for file_info in result['files']:
+                        relevant_files_set.add(file_info['older_file_url'])
+                elif 'pull' in url:
+                    print("Processing pull url, retrieving changed files")
+                    result = handle_pr_files_via_api(url)
+                    for file_info in result['files']:
+                        relevant_files_set.add(file_info['old_blob_url'])
+                elif 'compare' in url:
+                    print("Processing compare url, retrieving changed files")
+                    result = handle_compare_files_via_api(url)
+                    for file_info in result['files']:
+                        relevant_files_set.add(file_info['older_file_url'])
+                elif 'tree' in url:
+                    print("Processing tree url, relevant smart contract files")
+                    result = retrieve_all_smart_contract_files(url)
+                    if hasattr(result, 'files') or isinstance(result, dict) and 'files' in result:
+                        files = result['files'] if isinstance(result, dict) else result.files
+                        for file in files:
+                            if 'blob_url' in file:
+                                relevant_files_set.add(file['blob_url'])
+                elif 'blob' in url:
+                    print("Blob detected, doing nothing")
+                    relevant_files_set.add(url)
+    
+        # Convert set back to list for final use, filtering out test files
+        relevant_files = [f for f in relevant_files_set if ".t." not in f]
+        
+        print(f"\nFound {len(relevant_files)} unique relevant files:")
+        for file_url in relevant_files:
+            print(f"  - {file_url}")
+
+        # Store the results for this report in the dictionary
+        results_dict[report_title] = relevant_files
+
+        #### Do semantic analyis to determine which files are relevant
+    return results_dict
+
+    
+
+def main():
+    json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
+
+    # Load JSON file
+    results = get_relevant_files(json_file)
+    print(results)
 
 
 if __name__ == "__main__":

@@ -65,10 +65,33 @@ class GitHubAPIHandler:
                 
                 # Process changed files
                 for file_info in compare_data.get('files', []):
-                    older_blob_url = f"https://github.com/{owner}/{repo}/blob/{base}/{quote(file_info['filename'])}" if file_info['status'] != 'added' else ''
-
+                    # Determine the correct older filename and blob URL
+                    older_blob_url = ''
+                    older_filename = file_info['filename']
+                    
+                    if file_info['status'] == 'added':
+                        # New file, no older version exists
+                        older_blob_url = ''
+                        older_filename = ''
+                    elif file_info['status'] == 'removed':
+                        # File was deleted, older version exists with same name
+                        older_blob_url = f"https://github.com/{owner}/{repo}/blob/{base}/{quote(file_info['filename'])}"
+                        older_filename = file_info['filename']
+                    elif file_info['status'] == 'renamed':
+                        # File was renamed, use the previous_filename if available
+                        if 'previous_filename' in file_info:
+                            older_filename = file_info['previous_filename']
+                            older_blob_url = f"https://github.com/{owner}/{repo}/blob/{base}/{quote(older_filename)}"
+                        else:
+                            # Fallback to current filename if previous_filename not available
+                            older_blob_url = f"https://github.com/{owner}/{repo}/blob/{base}/{quote(file_info['filename'])}"
+                    else:
+                        # Modified file, same filename
+                        older_blob_url = f"https://github.com/{owner}/{repo}/blob/{base}/{quote(file_info['filename'])}"
+                    
                     file_data = {
                         'filename': file_info['filename'],
+                        'older_filename': older_filename,
                         'status': file_info['status'],  # added, modified, removed, renamed
                         'additions': file_info.get('additions', 0),
                         'deletions': file_info.get('deletions', 0),
@@ -76,7 +99,9 @@ class GitHubAPIHandler:
                         'patch': file_info.get('patch', ''),
                         'raw_url': file_info.get('raw_url', ''),
                         'blob_url': file_info.get('blob_url', ''),
-                        'older_blob_url': older_blob_url
+                        'older_blob_url': older_blob_url,
+                        'previous_filename': file_info.get('previous_filename', ''),  # Available for renames
+                        'contents_url': file_info.get('contents_url', '')
                     }
                     compare_info['files'].append(file_data)
                 
@@ -141,6 +166,12 @@ class GitHubAPIHandler:
         except Exception as e:
             print(f"Error getting file content: {e}")
             return None
+    
+    def get_older_file_raw_url(self, owner, repo, base_commit, file_path):
+        """
+        Get the raw URL for a file at a specific commit
+        """
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{base_commit}/{file_path}"
 
 def parse_github_url(url):
     """Parse GitHub URL to extract owner, repo, and compare info"""
@@ -199,22 +230,40 @@ def handle_compare_files_via_api(github_url, search_terms=None):
     
     for file_info in compare_info['files']:
         filename = file_info['filename']
+        older_filename = file_info['older_filename']
         #print(f"  - {filename} ({file_info['status']}, +{file_info['additions']}/-{file_info['deletions']})")
         
-        if filename.endswith(smart_contract_extensions):
+        # Check if either current or older filename matches smart contract extensions
+        is_smart_contract = (filename.endswith(smart_contract_extensions) or 
+                           (older_filename and older_filename.endswith(smart_contract_extensions)))
+        
+        if is_smart_contract:
+            # Generate older raw URL for content fetching
+            older_raw_url = ''
+            if file_info['status'] != 'added' and older_filename:
+                older_raw_url = api.get_older_file_raw_url(owner, repo, base, older_filename)
+            
             file_match = {
                 'file_path': filename,
+                'older_file_path': older_filename,
                 'file_url': file_info['blob_url'],
                 'older_file_url': file_info['older_blob_url'],
                 'raw_url': file_info['raw_url'],
+                'older_raw_url': older_raw_url,
                 'status': file_info['status'],
                 'additions': file_info['additions'],
                 'deletions': file_info['deletions'],
+                'previous_filename': file_info.get('previous_filename', ''),
                 'score': 100
             }
             
             if search_terms:
+                # Calculate score based on both current and older filenames
                 score = calculate_relevance_score(filename, file_info.get('patch', ''), search_terms)
+                if older_filename and older_filename != filename:
+                    older_score = calculate_relevance_score(older_filename, file_info.get('patch', ''), search_terms)
+                    score = max(score, older_score)
+                
                 file_match['score'] = score
                 
                 if score > 0:
@@ -261,9 +310,16 @@ def main():
         print(f"Old tree version: {result['base_tree_url']}")
         print(f"New tree version: {result['head_tree_url']}")
         for file_info in result['files']:
+            print(f"Current file: {file_info['file_path']}")
+            if file_info['older_file_path'] and file_info['older_file_path'] != file_info['file_path']:
+                print(f"Previous file: {file_info['older_file_path']}")
             print(f"New Blob URL:  {file_info['file_url']}")
             print(f"Older Blob URL:  {file_info['older_file_url']}")
+            print(f"New Raw URL:  {file_info['raw_url']}")
+            if file_info['older_raw_url']:
+                print(f"Older Raw URL:  {file_info['older_raw_url']}")
             print(f"Status: {file_info['status']} (+{file_info['additions']}/-{file_info['deletions']})")
+            print("-" * 40)
             
     else:
         print("No matching files found")

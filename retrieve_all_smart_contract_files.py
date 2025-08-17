@@ -38,10 +38,13 @@ class GitHubSmartContractRetriever:
             'User-Agent': 'SmartContract-Retriever/1.0'
         })
         
-    def parse_github_url(self, url: str) -> Tuple[str, str]:
-        """Parse GitHub URL to extract owner and repository name."""
+    def parse_github_url(self, url: str) -> Tuple[str, str, str]:
+        """Parse GitHub URL to extract owner, repository name, and branch/commit."""
         # Remove trailing slash and .git if present
         url = url.rstrip('/').replace('.git', '')
+        
+        # Default branch
+        branch = 'main'
         
         # Handle different GitHub URL formats
         if 'github.com' in url:
@@ -54,18 +57,29 @@ class GitHubSmartContractRetriever:
                 parsed = urlparse(url)
                 path = parsed.path.lstrip('/')
             
-            parts = path.split('/')
+            # Check if URL contains tree/branch_name or commit hash
+            if '/tree/' in path:
+                parts = path.split('/tree/')
+                repo_path = parts[0]
+                branch = parts[1].split('/')[0]  # Get branch name before any subdirectory
+            else:
+                repo_path = path
+            
+            parts = repo_path.split('/')
             if len(parts) >= 2:
-                return parts[0], parts[1]
+                return parts[0], parts[1], branch
         
         raise ValueError(f"Invalid GitHub URL format: {url}")
     
-    def get_repository_contents(self, owner: str, repo: str, path: str = "") -> List[Dict]:
+    def get_repository_contents(self, owner: str, repo: str, path: str = "", ref: str = None) -> List[Dict]:
         """Get repository contents from GitHub API."""
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+        params = {}
+        if ref:
+            params['ref'] = ref
         
         try:
-            response = self.session.get(url)
+            response = self.session.get(url, params=params)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -91,33 +105,35 @@ class GitHubSmartContractRetriever:
             print(f"Error downloading file from {download_url}: {e}")
             return None
     
-    def scan_repository_recursive(self, owner: str, repo: str, path: str = "", verbose: bool = True) -> List[Dict]:
+    def create_blob_url(self, owner: str, repo: str, branch: str, file_path: str) -> str:
+        """Create GitHub blob URL for a file."""
+        return f"https://github.com/{owner}/{repo}/blob/{branch}/{file_path}"
+    
+    def scan_repository_recursive(self, owner: str, repo: str, branch: str, path: str = "", verbose: bool = True) -> List[Dict]:
         """Recursively scan repository for smart contract files, ignoring node_modules."""
         smart_contract_files = []
-        contents = self.get_repository_contents(owner, repo, path)
+        contents = self.get_repository_contents(owner, repo, path, ref=branch)
         
         for item in contents:
             if item['type'] == 'file':
                 if self.is_smart_contract_file(item['name']):
+                    blob_url = self.create_blob_url(owner, repo, branch, item['path'])
                     smart_contract_files.append({
                         'name': item['name'],
                         'path': item['path'],
                         'download_url': item['download_url'],
+                        'blob_url': blob_url,
                         'size': item['size'],
                         'sha': item['sha']
                     })
-                    if verbose:
-                        print(f"Found smart contract: {item['path']}")
+                    
             elif item['type'] == 'dir':
                 # Skip node_modules directory
                 if item['name'] == 'node_modules':
-                    if verbose:
-                        print(f"Skipping node_modules directory: {item['path']}")
                     continue
                 # Recursively scan other subdirectories
-                if verbose:
-                    print(f"Scanning directory: {item['path']}")
-                subdirectory_files = self.scan_repository_recursive(owner, repo, item['path'], verbose)
+                
+                subdirectory_files = self.scan_repository_recursive(owner, repo, branch, item['path'], verbose)
                 smart_contract_files.extend(subdirectory_files)
         
         return smart_contract_files
@@ -159,27 +175,28 @@ def get_smart_contracts(github_url: str,
         print(f"Found {results['summary']['total_files']} smart contract files")
         for file_info in results['files']:
             print(f"- {file_info['path']}: {len(file_info['content'])} characters")
+            print(f"  Blob URL: {file_info['blob_url']}")
             print(f"  First 100 chars: {file_info['content'][:100]}...")
     """
     
     retriever = GitHubSmartContractRetriever(api_key)
     
     try:
-        owner, repo = retriever.parse_github_url(github_url)
+        owner, repo, branch = retriever.parse_github_url(github_url)
+        
         if verbose:
-            print(f"Scanning repository: {owner}/{repo}")
+            print(f"Scanning repository: {owner}/{repo} (branch: {branch})")
         
         # Find all smart contract files
-        smart_contract_files = retriever.scan_repository_recursive(owner, repo, verbose=verbose)
+        smart_contract_files = retriever.scan_repository_recursive(owner, repo, branch, verbose=verbose)
         
         if not smart_contract_files:
             if verbose:
                 print("No smart contract files found in the repository.")
-            return {'files': [], 'summary': {'repository': f"{owner}/{repo}", 'total_files': 0, 'extensions': {}}}
+            return {'files': [], 'summary': {'repository': f"{owner}/{repo}", 'branch': branch, 'total_files': 0, 'extensions': {}}}
         
         if verbose:
-            print(f"\nFound {len(smart_contract_files)} smart contract files")
-            print("Downloading file contents...")
+            print(f"Found {len(smart_contract_files)} smart contract files. Downloading content...")
         
         # Download content for each file
         files_with_content = []
@@ -193,6 +210,8 @@ def get_smart_contracts(github_url: str,
                     'name': file_info['name'],
                     'path': file_info['path'],
                     'content': content,
+                    'blob_url': file_info['blob_url'],
+                    'download_url': file_info['download_url'],
                     'size': file_info['size'],
                     'sha': file_info['sha']
                 })
@@ -210,6 +229,7 @@ def get_smart_contracts(github_url: str,
         
         summary = {
             'repository': f"{owner}/{repo}",
+            'branch': branch,
             'total_files': len(files_with_content),
             'extensions': extensions,
             'total_content_size': total_content_size,
@@ -221,6 +241,7 @@ def get_smart_contracts(github_url: str,
             print("SUMMARY")
             print(f"{'='*50}")
             print(f"Repository: {summary['repository']}")
+            print(f"Branch: {summary['branch']}")
             print(f"Successfully downloaded: {summary['total_files']} smart contract files")
             print(f"Total content size: {summary['total_content_size']:,} characters")
             
@@ -244,6 +265,7 @@ def get_smart_contracts(github_url: str,
             'files': [], 
             'summary': {
                 'repository': 'Unknown',
+                'branch': 'Unknown',
                 'total_files': 0, 
                 'extensions': {},
                 'error': str(e)
@@ -262,17 +284,19 @@ if __name__ == "__main__":
     else:
         # Example: Get all smart contract files with their content
         results = get_smart_contracts(
-            github_url="https://github.com/PotLock/grantpicks/blob/69f785ed988d4aeefc4a041047bb5e4d200c6967/stellar/contract/lists/src/internal.rs",
+            github_url="https://github.com/get-smooth/crypto-lib/tree/f40942c2bdff620d9fb1935054c8d0b21e6f17b1",
             api_key=API_KEY
         )
         
         # Access results
-        for file in results['files']:  # Show first 3 files
+        for file in results['files'][:3]:  # Show first 3 files
             print(f"\n- {file['path']} ({len(file['content'])} characters)")
+            print(f"  Blob URL: {file['blob_url']}")
             print(f"  Content preview: {file['content'][:100]}...")
         
-        # You can now access the full content of each file
+        # You can now access the full content of each file and its blob URL
         # for file in results['files']:
         #     if file['name'].endswith('.sol'):
         #         print(f"\nSolidity file: {file['path']}")
+        #         print(f"GitHub URL: {file['blob_url']}")
         #         print(file['content'])  # Full file content

@@ -82,10 +82,21 @@ class GitHubAPIHandler:
                 
                 # Process changed files
                 for file_info in commit_data.get('files', []):
-                    # Construct older blob URL using parent_sha and filename
-                    older_blob_url = f"https://github.com/{owner}/{repo}/blob/{parent_sha}/{quote(file_info['filename'])}" if file_info['status'] != 'added' else ''
+                    # Determine the correct filename for the older version
+                    older_filename = file_info['filename']  # Default to current filename
+                    
+                    # Handle renamed files - use previous_filename for older blob URL
+                    if file_info['status'] == 'renamed' and 'previous_filename' in file_info:
+                        older_filename = file_info['previous_filename']
+                    
+                    # Construct older blob URL using the correct older filename
+                    older_blob_url = ''
+                    if file_info['status'] != 'added':  # Don't create older URL for newly added files
+                        older_blob_url = f"https://github.com/{owner}/{repo}/blob/{parent_sha}/{quote(older_filename)}"
+                    
                     file_data = {
                         'filename': file_info['filename'],
+                        'older_filename': older_filename,  # Track the older filename separately
                         'status': file_info['status'],  # added, modified, removed, renamed
                         'additions': file_info.get('additions', 0),
                         'deletions': file_info.get('deletions', 0),
@@ -93,7 +104,8 @@ class GitHubAPIHandler:
                         'patch': file_info.get('patch', ''),
                         'raw_url': file_info.get('raw_url', ''),
                         'blob_url': file_info.get('blob_url', ''),  # Blob URL for the file in the current commit
-                        'older_blob_url': older_blob_url
+                        'older_blob_url': older_blob_url,
+                        'previous_filename': file_info.get('previous_filename', '')  # Include previous filename info
                     }
                     commit_info['files'].append(file_data)
                 
@@ -216,22 +228,39 @@ def handle_commit_files_via_api(github_url, search_terms=None):
     
     for file_info in commit_info['files']:
         filename = file_info['filename']
-        print(f"  - {filename} ({file_info['status']}, +{file_info['additions']}/-{file_info['deletions']})")
+        older_filename = file_info['older_filename']
+        status_info = f" ({file_info['status']}, +{file_info['additions']}/-{file_info['deletions']})"
         
-        if filename.endswith(smart_contract_extensions):
+        # Show rename information if applicable
+        if file_info['status'] == 'renamed' and file_info['previous_filename']:
+            print(f"  - {older_filename} → {filename}{status_info}")
+        else:
+            print(f"  - {filename}{status_info}")
+        
+        # Check if either the current or older filename matches smart contract extensions
+        current_is_contract = filename.endswith(smart_contract_extensions)
+        older_is_contract = older_filename.endswith(smart_contract_extensions)
+        
+        if current_is_contract or older_is_contract:
             file_match = {
                 'file_path': filename,
+                'older_file_path': older_filename,  # Include older file path
                 'file_url': file_info['blob_url'],  # Blob URL for the file in the current commit
                 'older_file_url': file_info['older_blob_url'],
                 'raw_url': file_info['raw_url'],
                 'status': file_info['status'],
                 'additions': file_info['additions'],
                 'deletions': file_info['deletions'],
-                'score': 100
+                'score': 100,
+                'previous_filename': file_info['previous_filename']  # Include rename info
             }
             
             if search_terms:
-                score = calculate_relevance_score(filename, file_info.get('patch', ''), search_terms)
+                # Calculate score based on both current and older filenames
+                score = max(
+                    calculate_relevance_score(filename, file_info.get('patch', ''), search_terms),
+                    calculate_relevance_score(older_filename, file_info.get('patch', ''), search_terms)
+                )
                 file_match['score'] = score
                 
                 if score > 0:
@@ -266,7 +295,7 @@ def calculate_relevance_score(filename, patch_content, search_terms):
 
 def main():
     """Test the GitHub API approach with a commit"""
-    test_url = "https://github.com/get-smooth/crypto-lib/commit/c559657"
+    test_url = "https://github.com/get-smooth/crypto-lib/commit/0af3c3cae84b29a14fa374a29824dc3abbb3d586"
     
     # print("Testing GitHub API approach for commit...")
     # print("=" * 60)
@@ -279,6 +308,8 @@ def main():
         # print(f"\n✓ Found {len(result['files'])} smart contract files:")
         for file_info in result['files']:
             print(f"\nFile: {file_info['file_path']}")
+            if file_info['older_file_path'] != file_info['file_path']:
+                print(f"Previous name: {file_info['older_file_path']}")
             print(f"New Blob URL: {file_info['file_url']}")
             print(f"Older Blob URL: {file_info['older_file_url']}")
 
