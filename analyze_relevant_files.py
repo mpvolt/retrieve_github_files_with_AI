@@ -162,7 +162,71 @@ def calculate_code_similarity(code_snippet: str, file_content: str) -> float:
     
     return max_similarity
 
+SMART_CONTRACT_EXTENSIONS = (
+        '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
+    )
 
+def _paths_have_similar_structure(mentioned_path: str, actual_path: str) -> bool:
+    """Check if two paths have similar directory structure"""
+    mentioned_parts = Path(mentioned_path).parts
+    actual_parts = Path(actual_path).parts
+    
+    # Check if they share significant directory components
+    if len(mentioned_parts) < 2 or len(actual_parts) < 2:
+        return False
+    
+    # Count matching directory components (excluding filename)
+    mentioned_dirs = mentioned_parts[:-1]
+    actual_dirs = actual_parts[:-1]
+    
+    common_dirs = set(mentioned_dirs) & set(actual_dirs)
+    
+    # Consider similar if they share at least 60% of directory components
+    min_dirs = min(len(mentioned_dirs), len(actual_dirs))
+    return len(common_dirs) / max(min_dirs, 1) >= 0.6
+
+def _files_semantically_related(mentioned_file: str, actual_file: str) -> bool:
+    """Check if two filenames are semantically related"""
+    mentioned_name = Path(mentioned_file).stem.lower()
+    actual_name = Path(actual_file).stem.lower()
+    
+    # Extract keywords from filenames
+    def extract_keywords(filename):
+        # Split on common separators and filter short words
+        words = re.split(r'[_\-\./]', filename)
+        return set(word for word in words if len(word) > 2)
+    
+    mentioned_keywords = extract_keywords(mentioned_name)
+    actual_keywords = extract_keywords(actual_name)
+    
+    # Check for semantic relationships
+    semantic_pairs = [
+        (['time', 'travel'], ['travel', 'call']),
+        (['verifier', 'verify'], ['call', 'executor']),
+        (['engine', 'core'], ['service', 'handler']),
+        (['validator', 'verifier'], ['checker', 'validator']),
+    ]
+    
+    # Direct keyword overlap (at least 50% shared keywords)
+    if mentioned_keywords and actual_keywords:
+        overlap = mentioned_keywords & actual_keywords
+        if len(overlap) / max(len(mentioned_keywords), len(actual_keywords)) >= 0.5:
+            return True
+    
+    # Check semantic pairs
+    for group1, group2 in semantic_pairs:
+        mentioned_has_group1 = any(word in mentioned_keywords for word in group1)
+        mentioned_has_group2 = any(word in mentioned_keywords for word in group2)
+        actual_has_group1 = any(word in actual_keywords for word in group1)
+        actual_has_group2 = any(word in actual_keywords for word in group2)
+        
+        if (mentioned_has_group1 and actual_has_group2) or (mentioned_has_group2 and actual_has_group1):
+            return True
+    
+    # Fuzzy string similarity as fallback
+    similarity = fuzz.ratio(mentioned_name, actual_name)
+    return similarity > 70
+    
 def match_files_to_report(report: Dict, relevant_files: Set[str], api_key: str) -> List[Dict]:
     """Match files to a specific vulnerability report - HIGHEST SIMILARITY SCORING"""
     matched_files = []
@@ -191,6 +255,41 @@ def match_files_to_report(report: Dict, relevant_files: Set[str], api_key: str) 
     # Extract file paths from title and description
     all_text = f"{title} {description}"
     mentioned_paths = extract_file_paths_from_text(all_text)
+    
+    # NEW: Detect smart contract extensions in the report
+    required_extensions = set()
+    all_report_text = f"{title} {description} {' '.join(mentioned_files) if mentioned_files else ''} {' '.join(broken_code_snippets)}"
+    
+    for ext in SMART_CONTRACT_EXTENSIONS:
+        if ext in all_report_text:
+            required_extensions.add(ext)
+    
+    # Filter out test files first
+    non_test_files = set()
+    for file_url in relevant_files:
+        if 'test' not in file_url.lower() and 'errors' not in file_url.lower():
+            non_test_files.add(file_url)
+    
+    print(f"Filtered out test files: {len(relevant_files)} -> {len(non_test_files)} files")
+    relevant_files = non_test_files
+    
+    # If smart contract extensions are found, filter relevant_files to only include those extensions
+    if required_extensions:
+        print(f"Smart contract extensions detected: {required_extensions}")
+        filtered_files = set()
+        for file_url in relevant_files:
+            file_path = get_file_path_from_blob_url(file_url)
+            file_ext = Path(file_path).suffix.lower()
+            if file_ext in required_extensions:
+                filtered_files.add(file_url)
+        
+        print(f"Filtered from {len(relevant_files)} to {len(filtered_files)} files with matching extensions")
+        relevant_files = filtered_files
+        
+        # If no files match the required extensions, return empty result
+        if not relevant_files:
+            print("No files found with the required smart contract extensions")
+            return []
     
     # Extract identifiers from ALL broken code snippets
     all_code_identifiers = {'functions': set(), 'contracts': set(), 'variables': set(), 'modifiers': set()}
@@ -230,13 +329,19 @@ def match_files_to_report(report: Dict, relevant_files: Set[str], api_key: str) 
             file_match_scores = []
             for mentioned_file in mentioned_files:
                 mentioned_clean = mentioned_file.lower().strip()
+                mentioned_name = Path(mentioned_file).name.lower()
+                mentioned_stem = Path(mentioned_file).stem.lower()
                 
                 # Exact filename match
                 if mentioned_clean == file_name.lower():
                     file_match_scores.append(100.0)
                     match_reasons.append(f"Exact filename: {mentioned_file}")
+                # Exact path match
+                elif mentioned_clean == file_path.lower():
+                    file_match_scores.append(100.0)
+                    match_reasons.append(f"Exact path: {mentioned_file}")
                 # Filename without extension match  
-                elif mentioned_clean == file_stem.lower():
+                elif mentioned_stem == file_stem.lower():
                     file_match_scores.append(90.0)
                     match_reasons.append(f"Filename stem: {mentioned_file}")
                 # Mentioned file in full path
@@ -247,8 +352,16 @@ def match_files_to_report(report: Dict, relevant_files: Set[str], api_key: str) 
                 elif file_name.lower() in mentioned_clean:
                     file_match_scores.append(70.0)
                     match_reasons.append(f"File in mention: {mentioned_file}")
+                # Similar path structure (same directory structure)
+                elif _paths_have_similar_structure(mentioned_file, file_path):
+                    file_match_scores.append(75.0)
+                    match_reasons.append(f"Similar path structure: {mentioned_file}")
+                # Semantic filename similarity (e.g., time_travel.rs vs travel_call.rs)
+                elif _files_semantically_related(mentioned_file, file_path):
+                    file_match_scores.append(85.0)
+                    match_reasons.append(f"Semantically related: {mentioned_file}")
                 # Partial filename match
-                elif any(part in file_name.lower() for part in mentioned_clean.split() if len(part) > 2):
+                elif any(part in file_name.lower() for part in mentioned_clean.split('/') if len(part) > 2):
                     file_match_scores.append(60.0)
                     match_reasons.append(f"Partial filename: {mentioned_file}")
                     
@@ -590,7 +703,7 @@ def match_files_to_report(report: Dict, relevant_files: Set[str], api_key: str) 
     return matched_files
 
 def main():
-    json_file = "veridise/jfiltered_VAR_VLayer250210-1-findings.json"
+    #json_file = "veridise/filtered_VAR_VLayer250210-1-findings.json"
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
     #json_file = "zellic/filtered_WOOFi Swap.json"
     #json_file = "zellic/filtered_Nibiru.json"
