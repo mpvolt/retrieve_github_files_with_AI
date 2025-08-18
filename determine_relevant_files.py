@@ -77,6 +77,8 @@ def get_relevant_files(json_file):
             search_data['title'] = report['title']
         if 'description' in report:
             search_data['description'] = report['description'] 
+        if 'recommendation' in report:
+            search_data['recommendation'] = report['recommendation']
         if 'files' in report:
             search_data['files'] = report['files']
         if 'broken_code_snippets' in report:
