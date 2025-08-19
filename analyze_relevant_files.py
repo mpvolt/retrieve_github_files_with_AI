@@ -76,15 +76,12 @@ def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
 
     return [], None
     
-def main():
+def analyze_relevant_files(json_file):
     """Main function to process bug reports from JSON file and match them to files."""
     import json
     import os
     
-    json_file = "hacken/filtered_[SCA]LitLabGames_GameFI_Mar2023.json"
-    #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
-    #json_file = "veridise/filtered_VAR-Untangled-250508-vaults-V2-findings.json"
-        
+
     # Get GitHub API key
     api_key = os.getenv('GITHUB_API_KEY')
     if not api_key:
@@ -339,6 +336,13 @@ def main():
     
     return all_matches  # Returns ONLY high confidence matches (150+ score)
 
+def main():
+    json_file = "hacken/filtered_[SCA]LitLabGames_GameFI_Mar2023.json"
+
+    analyze_relevant_files(json_file)
+    #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
+    #json_file = "veridise/filtered_VAR-Untangled-250508-vaults-V2-findings.json"
+        
 
 if __name__ == "__main__":
     # Note: You may need to install required packages if not already installed
