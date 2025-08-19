@@ -2,13 +2,92 @@ import re
 import requests
 import os
 import base64
+import time
 from pathlib import Path
 from typing import Dict, List, Set, Optional
 from fuzzywuzzy import fuzz
+from urllib.parse import quote
 
 SMART_CONTRACT_EXTENSIONS = (
     '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
 )
+
+def search_github_for_code(code_snippet: str, repo_owner: str, repo_name: str, api_key: str) -> List[str]:
+    """
+    Search GitHub repository for code snippet using GitHub's search API.
+    
+    Args:
+        code_snippet: Code snippet to search for
+        repo_owner: Repository owner
+        repo_name: Repository name
+        api_key: GitHub API key
+    
+    Returns:
+        List of file paths that contain the code snippet
+    """
+    # Take first 30 characters and clean up for search
+    search_query = code_snippet[:30].strip()
+    if not search_query:
+        return []
+    
+    # GitHub search API endpoint
+    url = "https://api.github.com/search/code"
+    
+    # Search parameters
+    params = {
+        'q': f'"{search_query}" repo:{repo_owner}/{repo_name}',
+        'per_page': 10  # Limit results
+    }
+    
+    headers = {
+        'Authorization': f'token {api_key}',
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'Bug-Matcher/1.0'
+    }
+    
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        
+        # Handle rate limiting
+        if response.status_code == 403 and 'rate limit' in response.text.lower():
+            print(f"    GitHub search rate limited, skipping search")
+            return []
+        
+        if response.status_code == 200:
+            data = response.json()
+            file_paths = []
+            for item in data.get('items', []):
+                file_paths.append(item['path'])
+            print(f"    GitHub search found {len(file_paths)} files with code snippet")
+            return file_paths
+        else:
+            print(f"    GitHub search failed: {response.status_code}")
+            return []
+            
+    except Exception as e:
+        print(f"    GitHub search error: {str(e)}")
+        return []
+
+def extract_repo_info_from_blob_url(blob_url: str) -> tuple:
+    """
+    Extract repository owner and name from a GitHub blob URL.
+    
+    Args:
+        blob_url: GitHub blob URL
+    
+    Returns:
+        Tuple of (repo_owner, repo_name)
+    """
+    # Example URL: https://github.com/owner/repo/blob/main/path/to/file.sol
+    try:
+        parts = blob_url.split('/')
+        if 'github.com' in blob_url and len(parts) >= 5:
+            repo_owner = parts[3]
+            repo_name = parts[4]
+            return repo_owner, repo_name
+    except Exception:
+        pass
+    return None, None
 
 def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
     """Get file content using GitHub API from blob URL"""
@@ -172,6 +251,7 @@ def calculate_function_match_score(bug_report: Dict, file_content: str) -> tuple
     # Extract function names from title and description
     title = bug_report.get('title', '')
     description = bug_report.get('description', '')
+    
     all_text = f"{title} {description}"
     
     mentioned_functions = extract_function_names_from_text(all_text)
@@ -311,6 +391,161 @@ def filter_relevant_files(file_urls: Set[str], bug_report: Dict) -> Set[str]:
     
     return filtered_files
 
+def calculate_filename_mention_score(bug_report: Dict, file_path: str) -> tuple[float, List[str]]:
+    """Calculate score if filename is explicitly mentioned in the bug report."""
+    match_reasons = []
+    max_score = 0.0
+    
+    # Get all text from the bug report
+    title = bug_report.get('title', '')
+    description = bug_report.get('description', '')
+    recommendation = bug_report.get('recommendation', '')
+    files = bug_report.get('files', '')
+    
+    # Extract code snippets
+    snippets = extract_code_snippets(bug_report)
+    snippet_text = ' '.join(snippets)
+    
+    # Combine all text
+    all_text = f"{title} {description} {recommendation} {snippet_text} {files}"
+    
+    # Get filename variations
+    full_filename = Path(file_path).name  # e.g., "VestingContract.sol"
+    filename_stem = Path(file_path).stem  # e.g., "VestingContract"
+    
+    # Also check path components
+    path_parts = file_path.split('/')
+    
+    print(f"    Checking filename mentions for: {full_filename}")
+    
+    # Check for exact filename match
+    if full_filename.lower() in all_text.lower():
+        max_score = max(max_score, 200.0)  # Very high score for exact filename
+        match_reasons.append(f"Exact filename mentioned: {full_filename}")
+        print(f"      ✓ Exact filename found: {full_filename}")
+    
+    # Check for filename without extension
+    elif filename_stem.lower() in all_text.lower():
+        # Additional check to make sure it's not just a substring
+        pattern = rf'\b{re.escape(filename_stem)}\b'
+        if re.search(pattern, all_text, re.IGNORECASE):
+            max_score = max(max_score, 180.0)
+            match_reasons.append(f"Filename stem mentioned: {filename_stem}")
+            print(f"      ✓ Filename stem found: {filename_stem}")
+    
+    # Check for any path components mentioned
+    for part in path_parts:
+        if len(part) > 3 and part.lower() in all_text.lower():
+            # Make sure it's a word boundary match
+            pattern = rf'\b{re.escape(part)}\b'
+            if re.search(pattern, all_text, re.IGNORECASE):
+                score_boost = 150.0 if part == filename_stem else 100.0
+                max_score = max(max_score, score_boost)
+                match_reasons.append(f"Path component mentioned: {part}")
+                print(f"      ✓ Path component found: {part}")
+    
+    # Check for common contract naming patterns in Solidity
+    if file_path.endswith('.sol'):
+        # Look for contract names that might match the filename
+        contract_patterns = [
+            rf'contract\s+{re.escape(filename_stem)}\b',
+            rf'interface\s+{re.escape(filename_stem)}\b',
+            rf'library\s+{re.escape(filename_stem)}\b'
+        ]
+        
+        for pattern in contract_patterns:
+            if re.search(pattern, all_text, re.IGNORECASE):
+                max_score = max(max_score, 190.0)
+                match_reasons.append(f"Contract name matches filename: {filename_stem}")
+                print(f"      ✓ Contract declaration found: {filename_stem}")
+                break
+    
+    # Check for fuzzy filename matches (handle typos or slight variations)
+    words_in_text = re.findall(r'\b\w+\b', all_text)
+    for word in words_in_text:
+        if len(word) > 4:  # Only check longer words
+            similarity = fuzz.ratio(word.lower(), filename_stem.lower())
+            if similarity > 85:  # Very similar
+                max_score = max(max_score, 160.0)
+                match_reasons.append(f"Similar filename: {word} ≈ {filename_stem}")
+                print(f"      ✓ Similar filename found: {word} (similarity: {similarity}%)")
+                break
+            elif similarity > 70:  # Somewhat similar
+                max_score = max(max_score, 120.0)
+                match_reasons.append(f"Fuzzy filename match: {word} ≈ {filename_stem}")
+                print(f"      ✓ Fuzzy filename match: {word} (similarity: {similarity}%)")
+                break
+    
+    return max_score, match_reasons
+
+def extract_function_names_from_description(bug_report: Dict) -> Set[str]:
+    """
+    Extract function names from bug report description that have () after them.
+    
+    Args:
+        bug_report: Dictionary containing bug report data
+    
+    Returns:
+        Set of function names found in the description
+    """
+    function_names = set()
+    
+    # Get description text
+    description = bug_report.get('description', '')
+    if not description:
+        return function_names
+    
+    # Enhanced patterns for function mentions with parentheses
+    patterns = [
+        r'(\w+)\(\)\s*function',  # functionName() function
+        r'the\s+(\w+)\(\)\s*function',  # the functionName() function
+        r'function\s+(\w+)\(',  # function functionName(
+        r'(\w+)\(\)',  # functionName() - basic pattern
+        r'In\s+the\s+(\w+)\(\)\s*function',  # In the functionName() function
+        r'call\s+(\w+)\(',  # call functionName(
+        r'calls?\s+(\w+)\(\)',  # call/calls functionName()
+        r'(\w+)\(\)\s*(?:method|call)',  # functionName() method/call
+        r'(\w+)\(\)\s*(?:first|afterward|then)',  # functionName() first/afterward/then
+        r'invoke\s+(\w+)\(',  # invoke functionName(
+        r'execute\s+(\w+)\(',  # execute functionName(
+        r'(\w+)\(\)\s*(?:is|are)\s+being',  # functionName() is being
+        r'(\w+)\(\)\s*(?:does not|doesn\'t)',  # functionName() does not
+        r'(\w+)\(\)\s*can\s+',  # functionName() can
+        r'(\w+)\(\)\s*will\s+',  # functionName() will
+        r'_(\w+)\(\)',  # _functionName() - internal functions
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, description, re.IGNORECASE)
+        for match in matches:
+            # Filter out common words and ensure it looks like a function name
+            if (len(match) > 2 and 
+                match.isalpha() and 
+                match.lower() not in {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'when', 'where', 'what', 'how', 'can', 'will', 'does', 'not', 'are', 'being'}):
+                function_names.add(match)
+    
+    return function_names
+    """Extract function names mentioned in text descriptions."""
+    function_names = set()
+    
+    # Common patterns for function mentions in descriptions
+    patterns = [
+        r'(\w+)\(\)\s*function',  # functionName() function
+        r'the\s+(\w+)\(\)\s*function',  # the functionName() function
+        r'function\s+(\w+)\(',  # function functionName(
+        r'_(\w+)\(\)',  # _functionName()
+        r'(\w+)\(\)\s*(?:method|call)',  # functionName() method/call
+        r'call\s+(\w+)\(',  # call functionName(
+        r'calls?\s+(\w+)\(\)',  # call/calls functionName()
+        r'(\w+)\(\)\s*(?:first|afterward|then)',  # functionName() first/afterward/then
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        function_names.update(m for m in matches if len(m) > 2 and m.isalpha())
+    
+    return function_names
+
 def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: str, max_results: int = 10) -> List[Dict]:
     """
     Match a bug report to the most relevant GitHub files.
@@ -333,6 +568,76 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
     # Extract code snippets
     code_snippets = extract_code_snippets(bug_report)
     print(f"Found {len(code_snippets)} code snippets")
+    
+    # GitHub search boost preparation
+    github_search_matches = set()
+    if github_blob_urls:
+        # Get repo info from first blob URL (assuming all URLs are from same repo)
+        first_url = next(iter(github_blob_urls))
+        repo_owner, repo_name = extract_repo_info_from_blob_url(first_url)
+        
+        if repo_owner and repo_name:
+            print(f"\n--- GitHub Search Boost ---")
+            print(f"Searching repo: {repo_owner}/{repo_name}")
+            
+            search_performed = False
+            
+            # First priority: Search for first code snippet (first 30 characters)
+            if code_snippets and code_snippets[0]:
+                print(f"Searching for code snippet: '{code_snippets[0][:30]}...'")
+                search_results = search_github_for_code(code_snippets[0], repo_owner, repo_name, api_key)
+                github_search_matches.update(search_results)
+                search_performed = True
+                
+                # Small delay to avoid rate limiting
+                time.sleep(0.1)
+            
+            # If no results from code snippet search, try function names from description
+            if not github_search_matches and not search_performed:
+                print("No code snippets found, searching for function names in description...")
+                function_names = extract_function_names_from_description(bug_report)
+                
+                if function_names:
+                    print(f"Found function names in description: {list(function_names)}")
+                    
+                    # Try searching for each function name
+                    for func_name in list(function_names)[:3]:  # Limit to first 3 to avoid rate limiting
+                        print(f"Searching for function: '{func_name}'")
+                        search_results = search_github_for_code(func_name, repo_owner, repo_name, api_key)
+                        if search_results:
+                            github_search_matches.update(search_results)
+                            print(f"    Found matches for function '{func_name}': {len(search_results)} files")
+                            break  # Stop after first successful function search
+                        
+                        # Small delay to avoid rate limiting
+                        time.sleep(0.1)
+                else:
+                    print("No function names found in description")
+            elif not github_search_matches and search_performed:
+                print("No results from code snippet search, trying function names...")
+                function_names = extract_function_names_from_description(bug_report)
+                
+                if function_names:
+                    print(f"Found function names in description: {list(function_names)}")
+                    
+                    # Try searching for each function name
+                    for func_name in list(function_names)[:3]:  # Limit to first 3 to avoid rate limiting
+                        print(f"Searching for function: '{func_name}'")
+                        search_results = search_github_for_code(func_name, repo_owner, repo_name, api_key)
+                        if search_results:
+                            github_search_matches.update(search_results)
+                            print(f"    Found matches for function '{func_name}': {len(search_results)} files")
+                            break  # Stop after first successful function search
+                        
+                        # Small delay to avoid rate limiting
+                        time.sleep(0.1)
+            
+            if github_search_matches:
+                print(f"Total GitHub search matches found: {len(github_search_matches)} files")
+            else:
+                print("No GitHub search matches found")
+        else:
+            print("Could not extract repo info for GitHub search")
     
     # Filter relevant files
     relevant_files = filter_relevant_files(github_blob_urls, bug_report)
@@ -360,14 +665,30 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
         match_reasons = []
         score_breakdown = {}
         
-        # 1. Language match
+        # 1. GitHub Search Boost (HIGHEST PRIORITY)
+        if file_path in github_search_matches:
+            github_boost_score = 300.0  # Huge boost!
+            total_score += github_boost_score
+            match_reasons.append("GitHub search found exact code snippet match")
+            score_breakdown['github_search_boost'] = github_boost_score
+            print(f"    🚀 GitHub Search Boost: {github_boost_score:.1f} (EXACT CODE MATCH!)")
+        
+        # 2. Filename mention check (HIGH PRIORITY)
+        filename_score, filename_reasons = calculate_filename_mention_score(bug_report, file_path)
+        if filename_score > 0:
+            total_score += filename_score
+            match_reasons.extend(filename_reasons)
+            score_breakdown['filename_mention'] = filename_score
+            print(f"    Filename mention score: {filename_score:.1f}")
+        
+        # 3. Language match
         lang_score, lang_reasons = calculate_language_match_score(bug_report, file_path)
         if lang_score > 0:
             total_score += lang_score
             match_reasons.extend(lang_reasons)
             score_breakdown['language'] = lang_score
         
-        # 2. Code snippet similarity
+        # 4. Code snippet similarity
         if code_snippets:
             max_code_score = 0.0
             best_snippet_idx = -1
@@ -385,14 +706,14 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
                 match_reasons.append(f"Best code similarity (snippet {best_snippet_idx + 1}): {max_code_score:.1f}%")
                 score_breakdown['code_similarity'] = weighted_score
         
-        # 3. Function name matches
+        # 5. Function name matches
         func_score, func_reasons = calculate_function_match_score(bug_report, file_content)
         if func_score > 0:
             total_score += func_score
             match_reasons.extend(func_reasons)
             score_breakdown['functions'] = func_score
         
-        # 4. Variable name matches
+        # 6. Variable name matches
         var_score, var_reasons = calculate_variable_match_score(bug_report, file_content)
         if var_score > 0:
             total_score += var_score
@@ -410,7 +731,8 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
                 'total_score': total_score,
                 'match_reasons': match_reasons,
                 'score_breakdown': score_breakdown,
-                'bug_id': bug_report.get('id', 'unknown')
+                'bug_id': bug_report.get('id', 'unknown'),
+                'github_search_match': file_path in github_search_matches
             })
     
     # Sort by score (highest first) and return top results
@@ -455,6 +777,7 @@ def example_usage():
     for i, result in enumerate(results):
         print(f"\n{i+1}. {result['file_path']}")
         print(f"   Score: {result['total_score']:.1f}")
+        print(f"   GitHub Search Match: {result['github_search_match']}")
         print(f"   Reasons: {', '.join(result['match_reasons'])}")
 
 if __name__ == "__main__":
