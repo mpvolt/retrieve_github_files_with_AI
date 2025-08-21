@@ -37,6 +37,41 @@ class GitHubAPIHandler:
             print(f"Could not check rate limit: {e}")
         return True
     
+    def safe_url_encode(self, path):
+        """Safely encode a file path for GitHub URLs"""
+        # Split path by / and encode each part separately to handle special characters
+        parts = path.split('/')
+        encoded_parts = [quote(part, safe='') for part in parts]
+        return '/'.join(encoded_parts)
+    
+    def construct_blob_url(self, owner, repo, blob_sha, file_path):
+        """Construct a proper GitHub blob URL using blob SHA"""
+        encoded_path = self.safe_url_encode(file_path)
+        return f"https://github.com/{owner}/{repo}/blob/{blob_sha}/{encoded_path}"
+    
+    def get_file_blob_url_at_commit(self, owner, repo, commit_sha, file_path):
+        """Get the proper blob URL for a file at a specific commit"""
+        try:
+            # Get file info at specific commit to get the blob SHA
+            encoded_path = self.safe_url_encode(file_path)
+            url = f"{self.base_url}/repos/{owner}/{repo}/contents/{encoded_path}"
+            
+            response = self.session.get(url, params={'ref': commit_sha})
+            
+            if response.status_code == 200:
+                file_data = response.json()
+                blob_sha = file_data.get('sha')
+                if blob_sha:
+                    return self.construct_blob_url(owner, repo, blob_sha, file_path)
+            
+            # Fallback to commit-based URL if we can't get blob SHA
+            return self.construct_blob_url(owner, repo, commit_sha, file_path)
+            
+        except Exception as e:
+            print(f"Error getting blob URL for {file_path} at {commit_sha}: {e}")
+            # Fallback to commit-based URL
+            return self.construct_blob_url(owner, repo, commit_sha, file_path)
+    
     def get_commit_info(self, owner, repo, commit_hash):
         """
         Get detailed commit information including changed files via GitHub API.
@@ -45,7 +80,8 @@ class GitHubAPIHandler:
         """
         if not self.check_rate_limit():
             print("Rate limit exceeded!")
-            return None
+            time.sleep(60)
+            return self.get_commit_info(owner, repo, commit_hash)
             
         url = f"{self.base_url}/repos/{owner}/{repo}/commits/{commit_hash}"
         
@@ -82,30 +118,46 @@ class GitHubAPIHandler:
                 
                 # Process changed files
                 for file_info in commit_data.get('files', []):
-                    # Determine the correct filename for the older version
-                    older_filename = file_info['filename']  # Default to current filename
+                    # Get filenames for current and previous versions
+                    current_filename = file_info['filename']
+                    older_filename = file_info.get('previous_filename', current_filename)
                     
-                    # Handle renamed files - use previous_filename for older blob URL
+                    # For renamed files, use previous_filename for older version
                     if file_info['status'] == 'renamed' and 'previous_filename' in file_info:
                         older_filename = file_info['previous_filename']
                     
-                    # Construct older blob URL using the correct older filename
+                    # Get blob SHAs from the API response
+                    current_blob_sha = file_info.get('sha', commit_hash)  # Use file's blob SHA if available
+                    
+                    # Construct current blob URL using the file's blob SHA
+                    current_blob_url = self.construct_blob_url(owner, repo, current_blob_sha, current_filename)
                     older_blob_url = ''
-                    if file_info['status'] != 'added':  # Don't create older URL for newly added files
-                        older_blob_url = f"https://github.com/{owner}/{repo}/blob/{parent_sha}/{quote(older_filename)}"
+                    
+                    # For older blob URL, we need to get the file's blob SHA at parent commit
+                    # Only create older blob URL if file existed before (not for added files)
+                    if file_info['status'] not in ['added']:
+                        # We'll need to fetch the file's blob SHA at the parent commit
+                        older_blob_url = self.get_file_blob_url_at_commit(owner, repo, parent_sha, older_filename)
+                    
+                    # Use API's raw_url if available, otherwise construct it
+                    raw_url = file_info.get('raw_url', '')
+                    if not raw_url and file_info['status'] != 'removed':
+                        encoded_filename = self.safe_url_encode(current_filename)
+                        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{commit_hash}/{encoded_filename}"
                     
                     file_data = {
-                        'filename': file_info['filename'],
-                        'older_filename': older_filename,  # Track the older filename separately
+                        'filename': current_filename,
+                        'older_filename': older_filename,
                         'status': file_info['status'],  # added, modified, removed, renamed
                         'additions': file_info.get('additions', 0),
                         'deletions': file_info.get('deletions', 0),
                         'changes': file_info.get('changes', 0),
                         'patch': file_info.get('patch', ''),
-                        'raw_url': file_info.get('raw_url', ''),
-                        'blob_url': file_info.get('blob_url', ''),  # Blob URL for the file in the current commit
+                        'raw_url': raw_url,
+                        'blob_url': current_blob_url,  # Now using proper blob SHA
                         'older_blob_url': older_blob_url,
-                        'previous_filename': file_info.get('previous_filename', '')  # Include previous filename info
+                        'previous_filename': file_info.get('previous_filename', ''),
+                        'current_blob_sha': current_blob_sha,  # Store for reference
                     }
                     commit_info['files'].append(file_data)
                 
@@ -115,9 +167,10 @@ class GitHubAPIHandler:
             elif response.status_code == 404:
                 print(f"✗ Commit {commit_hash} not found (404)")
                 return None
-            elif response.status_code == 403:
-                print(f"✗ API access forbidden (403). Check your API key or rate limits")
-                return None
+            elif response.status_code == 403 and 'rate limit' in response.text.lower():
+                print(f"Rate limit exceeded")
+                time.sleep(60)
+                return self.get_commit_info(owner, repo, commit_hash)
             else:
                 print(f"✗ API request failed with status {response.status_code}: {response.text}")
                 return None
@@ -146,9 +199,13 @@ class GitHubAPIHandler:
         Get specific file content at a specific commit via GitHub API
         """
         if not self.check_rate_limit():
-            return None
+            print("Rate limit exceeded")
+            time.sleep(60)
+            return self.get_file_content_at_commit(owner, repo, commit_hash, file_path)
             
-        url = f"{self.base_url}/repos/{owner}/{repo}/contents/{file_path}"
+        # Encode the file path properly for the API call
+        encoded_path = self.safe_url_encode(file_path)
+        url = f"{self.base_url}/repos/{owner}/{repo}/contents/{encoded_path}"
         
         try:
             response = self.session.get(url, params={'ref': commit_hash})
@@ -217,11 +274,11 @@ def handle_commit_files_via_api(github_url, search_terms=None):
         print("Could not retrieve commit information")
         return None
     
-    # print(f"Commit: {commit_info['message'][:100]}...")
-    # print(f"Author: {commit_info['author']} ({commit_info['date']})")
-    # print(f"Newer tree URL (commit, {commit_info['sha']}): {commit_info['newer_tree_url']}")
-    # print(f"Older tree URL (parent, {commit_info['parent_sha']}): {commit_info['older_tree_url']}")
-    # print(f"Changed files:")
+    print(f"Commit: {commit_info['message'][:100]}...")
+    print(f"Author: {commit_info['author']} ({commit_info['date']})")
+    print(f"Newer tree URL (commit, {commit_info['sha']}): {commit_info['newer_tree_url']}")
+    print(f"Older tree URL (parent, {commit_info['parent_sha']}): {commit_info['older_tree_url']}")
+    print(f"Changed files:")
     
     smart_contract_extensions = ('.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
     matching_files = []
@@ -244,15 +301,16 @@ def handle_commit_files_via_api(github_url, search_terms=None):
         if current_is_contract or older_is_contract:
             file_match = {
                 'file_path': filename,
-                'older_file_path': older_filename,  # Include older file path
-                'file_url': file_info['blob_url'],  # Blob URL for the file in the current commit
+                'older_file_path': older_filename,
+                'file_url': file_info['blob_url'],  # Now using proper blob SHA
                 'older_file_url': file_info['older_blob_url'],
                 'raw_url': file_info['raw_url'],
                 'status': file_info['status'],
                 'additions': file_info['additions'],
                 'deletions': file_info['deletions'],
                 'score': 100,
-                'previous_filename': file_info['previous_filename']  # Include rename info
+                'previous_filename': file_info['previous_filename'],
+                'current_blob_sha': file_info['current_blob_sha']
             }
             
             if search_terms:
@@ -294,37 +352,29 @@ def calculate_relevance_score(filename, patch_content, search_terms):
     return score
 
 def main():
-    """Test the GitHub API approach with a commit"""
-    test_url = "https://github.com/get-smooth/crypto-lib/commit/0af3c3cae84b29a14fa374a29824dc3abbb3d586"
+    """Test the GitHub API approach with the problematic commit"""
+    test_url = "https://github.com/hyperlane-xyz/hyperlane-monorepo/commit/def40316e9e0fee6857ece40d60a6ddcf2247e90"
     
-    # print("Testing GitHub API approach for commit...")
-    # print("=" * 60)
+    print("Testing GitHub API approach for commit...")
+    print("=" * 60)
     
     result = handle_commit_files_via_api(test_url)
     
     if result:
         print(f"\nNewer tree URL: {result['newer_tree_url']}")
         print(f"Older tree URL: {result['older_tree_url']}")
-        # print(f"\n✓ Found {len(result['files'])} smart contract files:")
+        print(f"\n✓ Found {len(result['files'])} smart contract files:")
         for file_info in result['files']:
             print(f"\nFile: {file_info['file_path']}")
             if file_info['older_file_path'] != file_info['file_path']:
                 print(f"Previous name: {file_info['older_file_path']}")
-            print(f"New Blob URL: {file_info['file_url']}")
+            print(f"Current Blob URL: {file_info['file_url']}")
             print(f"Older Blob URL: {file_info['older_file_url']}")
-
-            #print(f"Status: {file_info['status']} (+{file_info['additions']}/-{file_info['deletions']})")
-            
-            api = GitHubAPIHandler()
-            if file_info['raw_url']:
-                # print("Getting file content...")
-                content = api.get_file_content(file_info['raw_url'])
-                # if content:
-                #     print(f"Content preview (first 200 chars):")
-                #     print(content[:200] + "..." if len(content) > 200 else content)
-        
+            print(f"Raw URL: {file_info['raw_url']}")
+            print(f"Blob SHA: {file_info['current_blob_sha']}")
+            print(f"Status: {file_info['status']} (+{file_info['additions']}/-{file_info['deletions']})")
     else:
-        print("No matching files found")
+        print("No matching files found or error occurred")
 
 if __name__ == "__main__":
     main()

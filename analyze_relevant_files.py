@@ -8,6 +8,7 @@ from determine_relevant_files import get_relevant_files
 from retrieve_all_smart_contract_functions import extract_function_names
 from match_files_to_report import match_bug_to_files
 import requests
+import time
 
 
 
@@ -75,12 +76,14 @@ def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
         current_sha = commits[-1]["sha"]
 
     return [], None
-    
+
 def analyze_relevant_files(json_file):
     """Main function to process bug reports from JSON file and match them to files."""
     import json
     import os
+    import time
     
+    print(json_file)
 
     # Get GitHub API key
     api_key = os.getenv('GITHUB_API_KEY')
@@ -89,8 +92,9 @@ def analyze_relevant_files(json_file):
         print("Please set your GitHub API token: export GITHUB_API_KEY=your_token_here")
         return None
     
-    # Get all relevant files from the GitHub URLs in the JSON (now returns a dict)
-    relevant_files_dict = get_relevant_files(json_file)
+    # Get all relevant files AND the reports data from the JSON (now returns both)
+    relevant_files_dict, reports = get_relevant_files(json_file)
+    
     
     # Check if we have minimal files to process
     total_files = sum(len(files) for files in relevant_files_dict.values())
@@ -98,14 +102,7 @@ def analyze_relevant_files(json_file):
         print(f"Only {total_files} total files found across all reports. No matching needed.")
         return relevant_files_dict
     
-    print("Relevant files by report:")
-    for report_title, files in relevant_files_dict.items():
-        print(f"  {report_title}: {len(files)} files")
-    
-    # Load the JSON to process each report
-    with open(json_file, 'r') as f:
-        reports = json.load(f)
-    
+    # No need to read the JSON file again - we already have the reports data!
     if not isinstance(reports, list):
         reports = [reports]  # Handle single report case
     
@@ -162,9 +159,10 @@ def analyze_relevant_files(json_file):
             continue
         
         # If no files found, check commit history
-        if not report_relevant_files and report.get("source", ""):
+        # FIXED: Look for the correct field names that exist in your JSON
+        if not report_relevant_files and (report.get("source_code_url", "") or report.get("fix_commit_url", "")):
             print(f"  ⚠️ No relevant files found, walking commit history...")
-            source_url = report.get("source", "")
+            source_url = report.get("source_code_url", "") or report.get("fix_commit_url", "")
             matched_files, fix_commit = find_files_up_commit_history(report, source_url, api_key)
             if matched_files:
                 report["fix_commit_url"] = fix_commit
@@ -250,12 +248,24 @@ def analyze_relevant_files(json_file):
                 print(f"   URL: {match['blob_url']}")
                 print()
     
-    # Save the updated reports back to the JSON file
-    output_file = json_file.replace('.json')
-    with open(output_file, 'w') as f:
-        json.dump(reports, f, indent=2)
-    print(f"\n✓ Updated JSON with afflicted_github_code_blob fields saved to: {output_file}")
+
+    json_path = Path(json_file)
+    json_dir = json_path.parent
+    print(f"Using pathlib - parent dir: {json_dir}")
+    print(f"Parent dir exists (pathlib): {json_dir.exists()}")
     
+    if json_dir != Path('.'):  # Only create directory if there's a path
+        print(f"Creating directory: {json_dir}")
+        json_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Try the write operation
+    print(f"Attempting to write {len(reports)} reports...")
+    with open(json_file, 'w', encoding='utf-8') as f:
+        json.dump(reports, f, indent=2)
+    
+    print(f"✓ Successfully wrote file")
+    print(f"✓ Updated JSON with afflicted_github_code_blob fields saved to: {json_file}")
+        
     # Enhanced Summary Section
     print(f"\n{'='*80}")
     print("FINAL SUMMARY - HIGH CONFIDENCE MATCHES ONLY (150+ SCORE)")
@@ -337,7 +347,7 @@ def analyze_relevant_files(json_file):
     return all_matches  # Returns ONLY high confidence matches (150+ score)
 
 def main():
-    json_file = "hacken/filtered_[SCA]LitLabGames_GameFI_Mar2023.json"
+    json_file = "hacken/filtered_[SCA]Hyperlane_InterchainMessageService_Apr2023.json"
 
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
@@ -352,10 +362,10 @@ if __name__ == "__main__":
     # Run your main function and get file matches
     all_matches = main()
 
-    # Get just the file names (what you see in File Match column)
-    matched_files = []
-    for report_title, matches in all_matches.items():
-        if matches:  # Only high confidence matches are in all_matches
-            matched_files.append(matches[0]['file_name'])  # Top match
+    # # Get just the file names (what you see in File Match column)
+    # matched_files = []
+    # for report_title, matches in all_matches.items():
+    #     if matches:  # Only high confidence matches are in all_matches
+    #         matched_files.append(matches[0]['file_name'])  # Top match
 
-    print("Matched Files:", matched_files)
+    print("Matched Files:", all_matches)

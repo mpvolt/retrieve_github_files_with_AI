@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import requests
 from urllib.parse import urlparse
 from retrieve_all_smart_contract_files import get_smart_contracts
 from retrieve_changed_commits_files import handle_commit_files_via_api
@@ -19,6 +20,17 @@ SMART_CONTRACT_EXTENSIONS = (
         '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
     )
 API_KEY = os.getenv('GITHUB_API_KEY')
+
+# Create a session for file validation
+file_validation_session = requests.Session()
+file_validation_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+})
+
+if API_KEY:
+    file_validation_session.headers.update({
+        'Authorization': f'token {API_KEY}'
+    })
 
 def extract_string_values(obj):
     """Recursively extracts all string values from a JSON object (dict or list)."""
@@ -37,6 +49,34 @@ def extract_string_values(obj):
                 strings.extend(extract_string_values(item))
     return strings
 
+def validate_file_exists(url):
+    """
+    Validate that a GitHub file URL exists and is accessible.
+    Works with both blob URLs and raw URLs.
+    """
+    try:
+        # For blob URLs, convert to raw URL for validation
+        if '/blob/' in url:
+            # Convert blob URL to raw URL for checking
+            # https://github.com/owner/repo/blob/commit/path -> https://raw.githubusercontent.com/owner/repo/commit/path
+            raw_url = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+            response = file_validation_session.get(raw_url, timeout=10)
+        else:
+            # For other URLs, check directly
+            response = file_validation_session.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            return True
+        elif response.status_code == 404:
+            print(f"  ⚠ File not found (404): {url}")
+            return False
+        else:
+            print(f"  ⚠ Unexpected status {response.status_code} for: {url}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        print(f"  ⚠ Error validating {url}: {e}")
+        return False
 
 def get_relevant_files(json_file):
     try:
@@ -44,7 +84,7 @@ def get_relevant_files(json_file):
             reports = json.load(f)  # could be a list
     except (IOError, json.JSONDecodeError) as e:
         print(f"Error reading JSON file: {e}")
-        return {}
+        return {}, []  # Return both empty dict and empty list
 
     if isinstance(reports, dict):
         reports = [reports]  # wrap single object in a list
@@ -162,7 +202,6 @@ def get_relevant_files(json_file):
         # Convert set back to list for final use, filtering out test files
         relevant_files = [f for f in relevant_files_set if ".t." not in f]
         
-        print(f"\nFound {len(relevant_files)} unique relevant files:")
         for file_url in relevant_files:
             print(f"  - {file_url}")
 
@@ -170,16 +209,18 @@ def get_relevant_files(json_file):
         results_dict[report_title] = relevant_files
 
         #### Do semantic analyis to determine which files are relevant
-    return results_dict
+    
+    return results_dict, reports  # Return both the files dict AND the reports data
+
 
     
 
 def main():
-    json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
+    json_file = "hacken/filtered_[SCA]Hyperlane_InterchainMessageService_Apr2023.json"
 
     # Load JSON file
     results = get_relevant_files(json_file)
-    print(results)
+    #print(results)
 
 
 if __name__ == "__main__":

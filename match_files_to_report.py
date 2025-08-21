@@ -50,8 +50,9 @@ def search_github_for_code(code_snippet: str, repo_owner: str, repo_name: str, a
         
         # Handle rate limiting
         if response.status_code == 403 and 'rate limit' in response.text.lower():
-            print(f"    GitHub search rate limited, skipping search")
-            return []
+            print(f"    GitHub search rate limited, waiting")
+            time.sleep(60)
+            search_github_for_code(code_snippet, repo_owner, repo_name, api_key)
         
         if response.status_code == 200:
             data = response.json()
@@ -90,7 +91,7 @@ def extract_repo_info_from_blob_url(blob_url: str) -> tuple:
     return None, None
 
 def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
-    """Get file content using GitHub API from blob URL"""
+    """Get file content using GitHub API from blob URL with rate limiting"""
     try:
         # Parse the blob URL to extract repo info and file path
         # Example: https://github.com/owner/repo/blob/branch/path/to/file.sol
@@ -112,8 +113,28 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
             'User-Agent': 'File-Matcher/1.0'
         }
         
-        response = requests.get(api_url, headers=headers)
-        response.raise_for_status()
+        # Retry loop for rate limiting
+        max_retries = 10
+        for attempt in range(max_retries):
+            response = requests.get(api_url, headers=headers)
+            
+            # Check if we hit rate limit (status code 403 with rate limit message)
+            if response.status_code == 403:
+                rate_limit_remaining = response.headers.get('X-RateLimit-Remaining', '0')
+                if rate_limit_remaining == '0':
+                    print(f"Rate limit exceeded. Waiting 60 seconds before retry (attempt {attempt + 1}/{max_retries})...")
+                    if attempt < max_retries - 1:  # Don't wait on the last attempt
+                        time.sleep(60)
+                        get_file_path_from_blob_url(blob_url, api_key)
+                    
+            
+            # If successful or other error, break the retry loop
+            response.raise_for_status()
+            break
+        else:
+            # This else clause executes if the loop completed without breaking
+            # (meaning all retries failed due to rate limiting)
+            raise Exception("Failed to get content after maximum retries due to rate limiting")
         
         data = response.json()
         
@@ -126,9 +147,27 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
         # Fallback to raw URL method
         try:
             raw_url = blob_url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
-            response = requests.get(raw_url)
-            response.raise_for_status()
-            return response.text
+            
+            # Apply rate limiting to fallback method as well
+            max_retries = 10
+            for attempt in range(max_retries):
+                response = requests.get(raw_url)
+                
+                # Check for rate limiting on raw URL (GitHub also rate limits raw requests)
+                if response.status_code == 403:
+                    print(f"Rate limit on fallback method. Waiting 60 seconds (attempt {attempt + 1}/{max_retries})...")
+                    if attempt < max_retries - 1:
+                        time.sleep(60)
+                        get_file_content_from_blob_url(blob_url, api_key)
+                    else:
+                        print("Max retries reached for fallback method.")
+                        break
+                
+                response.raise_for_status()
+                return response.text
+            else:
+                raise Exception("Fallback method failed after maximum retries")
+                
         except Exception as e2:
             print(f"Fallback method also failed: {e2}")
             return ""
@@ -179,6 +218,7 @@ def extract_function_names_from_text(text: str) -> Set[str]:
         r'call\s+(\w+)\(',  # call functionName(
         r'calls?\s+(\w+)\(\)',  # call/calls functionName()
         r'(\w+)\(\)\s*(?:first|afterward|then)',  # functionName() first/afterward/then
+        r'(\w+)\s+functions?',  # functionName function/functions
     ]
     
     for pattern in patterns:
@@ -418,133 +458,438 @@ def calculate_filename_mention_score(bug_report: Dict, file_path: str) -> tuple[
     
     print(f"    Checking filename mentions for: {full_filename}")
     
-    # Check for exact filename match
-    if full_filename.lower() in all_text.lower():
-        max_score = max(max_score, 200.0)  # Very high score for exact filename
-        match_reasons.append(f"Exact filename mentioned: {full_filename}")
-        print(f"      ✓ Exact filename found: {full_filename}")
+    # Count exact filename mentions
+    exact_filename_patterns = [
+        # Exact filename with word boundaries
+        rf'\b{re.escape(full_filename)}\b',
+        # Filename at start of sentence or after common punctuation
+        rf'(?:^|[.\s,;:])\s*{re.escape(full_filename)}(?=\s|[.,;:]|$)',
+        # Filename in common contexts
+        rf'(?:in|file|contract|from|see|check|review)\s+{re.escape(full_filename)}',
+    ]
     
-    # Check for filename without extension
-    elif filename_stem.lower() in all_text.lower():
-        # Additional check to make sure it's not just a substring
-        pattern = rf'\b{re.escape(filename_stem)}\b'
-        if re.search(pattern, all_text, re.IGNORECASE):
-            max_score = max(max_score, 180.0)
-            match_reasons.append(f"Filename stem mentioned: {filename_stem}")
-            print(f"      ✓ Filename stem found: {filename_stem}")
+    exact_mentions_count = 0
+    for pattern in exact_filename_patterns:
+        matches = re.findall(pattern, all_text, re.IGNORECASE)
+        exact_mentions_count += len(matches)
     
-    # Check for any path components mentioned
-    for part in path_parts:
-        if len(part) > 3 and part.lower() in all_text.lower():
-            # Make sure it's a word boundary match
-            pattern = rf'\b{re.escape(part)}\b'
-            if re.search(pattern, all_text, re.IGNORECASE):
-                score_boost = 150.0 if part == filename_stem else 100.0
-                max_score = max(max_score, score_boost)
-                match_reasons.append(f"Path component mentioned: {part}")
-                print(f"      ✓ Path component found: {part}")
+    if exact_mentions_count > 0:
+        # Base score for first mention
+        base_score = 200.0
+        # Progressive bonus for additional mentions (diminishing returns)
+        bonus_score = 0
+        if exact_mentions_count > 1:
+            # Each additional mention adds less value: 50, 30, 20, 15, 10, ...
+            for i in range(1, exact_mentions_count):
+                bonus_multiplier = max(0.1, 1.0 - (i * 0.2))  # Diminishing returns
+                bonus_score += 50 * bonus_multiplier
+        
+        total_exact_score = base_score + bonus_score
+        max_score = max(max_score, total_exact_score)
+        match_reasons.append(f"Exact filename mentioned {exact_mentions_count} times: {full_filename} (score: {total_exact_score:.1f})")
+        print(f"      ✓ Exact filename found {exact_mentions_count} times: {full_filename} (score: {total_exact_score:.1f})")
     
-    # Check for common contract naming patterns in Solidity
-    if file_path.endswith('.sol'):
-        # Look for contract names that might match the filename
-        contract_patterns = [
-            rf'contract\s+{re.escape(filename_stem)}\b',
-            rf'interface\s+{re.escape(filename_stem)}\b',
-            rf'library\s+{re.escape(filename_stem)}\b'
+    # If no exact match found, check for filename without extension (with word boundaries)
+    if max_score < 200.0:
+        stem_patterns = [
+            rf'\b{re.escape(filename_stem)}\b',
+            # Also check with common extensions
+            rf'\b{re.escape(filename_stem)}\.(sol|vy|rs|move|cairo|fc|func|js|ts|py|java|cpp|c|h)\b',
         ]
         
-        for pattern in contract_patterns:
-            if re.search(pattern, all_text, re.IGNORECASE):
-                max_score = max(max_score, 190.0)
-                match_reasons.append(f"Contract name matches filename: {filename_stem}")
-                print(f"      ✓ Contract declaration found: {filename_stem}")
-                break
+        stem_mentions_count = 0
+        for pattern in stem_patterns:
+            matches = re.findall(pattern, all_text, re.IGNORECASE)
+            stem_mentions_count += len(matches)
+        
+        if stem_mentions_count > 0:
+            # Base score for first mention
+            base_score = 180.0
+            # Progressive bonus for additional mentions
+            bonus_score = 0
+            if stem_mentions_count > 1:
+                for i in range(1, stem_mentions_count):
+                    bonus_multiplier = max(0.1, 1.0 - (i * 0.2))
+                    bonus_score += 40 * bonus_multiplier
+            
+            total_stem_score = base_score + bonus_score
+            max_score = max(max_score, total_stem_score)
+            match_reasons.append(f"Filename stem mentioned {stem_mentions_count} times: {filename_stem} (score: {total_stem_score:.1f})")
+            print(f"      ✓ Filename stem found {stem_mentions_count} times: {filename_stem} (score: {total_stem_score:.1f})")
     
-    # Check for fuzzy filename matches (handle typos or slight variations)
-    words_in_text = re.findall(r'\b\w+\b', all_text)
-    for word in words_in_text:
-        if len(word) > 4:  # Only check longer words
-            similarity = fuzz.ratio(word.lower(), filename_stem.lower())
-            if similarity > 85:  # Very similar
-                max_score = max(max_score, 160.0)
-                match_reasons.append(f"Similar filename: {word} ≈ {filename_stem}")
-                print(f"      ✓ Similar filename found: {word} (similarity: {similarity}%)")
+    # Smart contract extensions
+    SMART_CONTRACT_EXTENSIONS = (
+        '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
+    )
+    
+    # Check for additional filename patterns only if no strong match found yet
+    if max_score < 180.0:
+        filename_patterns = [
+            # Mention in context (e.g., "In InterchainGasPaymaster.sol")
+            rf'(?:in|file|contract|from)\s+{re.escape(full_filename)}\b',
+            rf'(?:in|file|contract|from)\s+{re.escape(filename_stem)}\b',
+            # File paths or imports
+            rf'/{re.escape(full_filename)}\b',
+            rf'/{re.escape(filename_stem)}\b',
+        ]
+        
+        pattern_mentions_count = 0
+        matched_patterns = []
+        for pattern in filename_patterns:
+            matches = re.findall(pattern, all_text, re.IGNORECASE)
+            if matches:
+                pattern_mentions_count += len(matches)
+                matched_patterns.append(pattern)
+        
+        if pattern_mentions_count > 0:
+            # Base score depends on whether it's full filename or stem
+            base_score = 195.0 if any(full_filename.lower() in pattern.lower() for pattern in matched_patterns) else 175.0
+            # Bonus for multiple pattern matches
+            bonus_score = 0
+            if pattern_mentions_count > 1:
+                for i in range(1, pattern_mentions_count):
+                    bonus_multiplier = max(0.1, 1.0 - (i * 0.25))
+                    bonus_score += 30 * bonus_multiplier
+            
+            total_pattern_score = base_score + bonus_score
+            max_score = max(max_score, total_pattern_score)
+            match_reasons.append(f"Filename pattern matches {pattern_mentions_count} times (score: {total_pattern_score:.1f})")
+            print(f"      ✓ Filename pattern found {pattern_mentions_count} times (score: {total_pattern_score:.1f})")
+    
+    # Check for any path components mentioned (with word boundaries for shorter components)
+    path_component_scores = []
+    for part in path_parts:
+        if len(part) > 3:
+            part_mentions_count = 0
+            
+            if len(part) >= 6 or part == filename_stem:
+                # For longer parts, use simple substring matching first
+                if part.lower() in all_text.lower():
+                    # But verify it's not a substring of a longer word
+                    matches = re.findall(rf'\b{re.escape(part)}\b', all_text, re.IGNORECASE)
+                    part_mentions_count = len(matches)
+            else:
+                # For shorter path components, always use word boundaries
+                matches = re.findall(rf'\b{re.escape(part)}\b', all_text, re.IGNORECASE)
+                part_mentions_count = len(matches)
+            
+            if part_mentions_count > 0:
+                # Base score
+                base_score = 150.0 if part == filename_stem else 100.0
+                # Bonus for multiple mentions
+                bonus_score = 0
+                if part_mentions_count > 1:
+                    for i in range(1, part_mentions_count):
+                        bonus_multiplier = max(0.1, 1.0 - (i * 0.3))
+                        bonus_score += 25 * bonus_multiplier
+                
+                total_part_score = base_score + bonus_score
+                path_component_scores.append(total_part_score)
+                match_reasons.append(f"Path component '{part}' mentioned {part_mentions_count} times (score: {total_part_score:.1f})")
+                print(f"      ✓ Path component '{part}' found {part_mentions_count} times (score: {total_part_score:.1f})")
+    
+    # Take the highest path component score
+    if path_component_scores:
+        max_score = max(max_score, max(path_component_scores))
+    
+    # Check for common contract naming patterns in smart contract files
+    file_extension = Path(file_path).suffix.lower()
+    if file_extension in SMART_CONTRACT_EXTENSIONS:
+        # Look for contract/module names that might match the filename
+        contract_patterns = []
+        
+        if file_extension == '.sol':  # Solidity
+            contract_patterns = [
+                rf'contract\s+{re.escape(filename_stem)}\b',
+                rf'interface\s+{re.escape(filename_stem)}\b',
+                rf'library\s+{re.escape(filename_stem)}\b'
+            ]
+        elif file_extension == '.vy':  # Vyper
+            contract_patterns = [
+                rf'contract\s+{re.escape(filename_stem)}\b',
+                rf'interface\s+{re.escape(filename_stem)}\b'
+            ]
+        elif file_extension == '.rs':  # Rust (for smart contracts)
+            contract_patterns = [
+                rf'mod\s+{re.escape(filename_stem)}\b',
+                rf'contract\s+{re.escape(filename_stem)}\b',
+                rf'impl\s+{re.escape(filename_stem)}\b'
+            ]
+        elif file_extension == '.move':  # Move
+            contract_patterns = [
+                rf'module\s+{re.escape(filename_stem)}\b',
+                rf'resource\s+{re.escape(filename_stem)}\b',
+                rf'script\s+{re.escape(filename_stem)}\b'
+            ]
+        elif file_extension == '.cairo':  # Cairo
+            contract_patterns = [
+                rf'contract\s+{re.escape(filename_stem)}\b',
+                rf'namespace\s+{re.escape(filename_stem)}\b'
+            ]
+        elif file_extension in ['.fc', '.func']:  # FunC
+            contract_patterns = [
+                rf'contract\s+{re.escape(filename_stem)}\b',
+                rf'global\s+{re.escape(filename_stem)}\b'
+            ]
+        
+        contract_mentions_count = 0
+        for pattern in contract_patterns:
+            matches = re.findall(pattern, all_text, re.IGNORECASE)
+            contract_mentions_count += len(matches)
+        
+        if contract_mentions_count > 0:
+            # Base score for contract declarations
+            base_score = 190.0
+            # Bonus for multiple contract declarations (rare but possible)
+            bonus_score = 0
+            if contract_mentions_count > 1:
+                for i in range(1, contract_mentions_count):
+                    bonus_score += 20  # Fixed bonus since multiple contract declarations are significant
+            
+            total_contract_score = base_score + bonus_score
+            max_score = max(max_score, total_contract_score)
+            match_reasons.append(f"Contract/module name matches filename {contract_mentions_count} times: {filename_stem} (score: {total_contract_score:.1f})")
+            print(f"      ✓ Contract/module declaration found {contract_mentions_count} times: {filename_stem} (score: {total_contract_score:.1f})")
+    
+    # Special handling for compound names (e.g., InterchainGasPaymaster)
+    # Split camelCase/PascalCase names and check for partial matches
+    if len(filename_stem) > 8:  # Only for longer names
+        # Split on capital letters to get compound words
+        words = re.findall(r'[A-Z][a-z]*', filename_stem)
+        if len(words) >= 2:  # Must have at least 2 compound words
+            compound_score = 0
+            found_words = []
+            word_mention_counts = {}
+            
+            for word in words:
+                if len(word) >= 4:
+                    # Count mentions of each compound word
+                    matches = re.findall(rf'\b{re.escape(word)}\b', all_text, re.IGNORECASE)
+                    word_count = len(matches)
+                    if word_count > 0:
+                        word_mention_counts[word] = word_count
+                        found_words.append(word)
+                        # Base score per word found
+                        base_word_score = 30
+                        # Bonus for multiple mentions of the same word
+                        bonus_word_score = 0
+                        if word_count > 1:
+                            for i in range(1, word_count):
+                                bonus_multiplier = max(0.2, 1.0 - (i * 0.2))
+                                bonus_word_score += 10 * bonus_multiplier
+                        
+                        compound_score += base_word_score + bonus_word_score
+            
+            # If we found multiple compound words, it's likely the right file
+            if len(found_words) >= 2:
+                compound_score = min(compound_score, 140.0)  # Cap the score
+                max_score = max(max_score, compound_score)
+                word_details = [f"{word}({word_mention_counts[word]}x)" for word in found_words]
+                match_reasons.append(f"Compound words found: {', '.join(word_details)} from {filename_stem} (score: {compound_score:.1f})")
+                print(f"      ✓ Compound words found: {word_details} (score: {compound_score:.1f})")
+    
+    return max_score, match_reasons
+    
+def extract_function_names_from_text(text: str) -> Set[str]:
+    """Extract function names mentioned in text descriptions with better filtering."""
+    function_names = set()
+    
+    # Common words that should NOT be considered function names
+    EXCLUDE_WORDS = {
+        'the', 'and', 'for', 'with', 'from', 'this', 'that', 'when', 'where', 
+        'what', 'how', 'can', 'will', 'does', 'not', 'are', 'being', 'have',
+        'has', 'had', 'said', 'get', 'set', 'new', 'old', 'way', 'use', 'call',
+        'view', 'pure', 'true', 'false', 'null', 'void', 'int', 'uint', 'bool',
+        'string', 'address', 'bytes', 'mapping', 'array', 'struct', 'enum',
+        'public', 'private', 'internal', 'external', 'constant', 'immutable',
+        'override', 'virtual', 'abstract', 'interface', 'contract', 'library',
+        'function', 'modifier', 'event', 'error', 'using', 'import', 'pragma',
+        'require', 'assert', 'revert', 'emit', 'return', 'if', 'else', 'while',
+        'for', 'do', 'break', 'continue', 'try', 'catch', 'throw', 'finally'
+    }
+    
+    # Enhanced patterns for function mentions with better context
+    patterns = [
+        # Function definitions and calls with clear indicators
+        r'function\s+(\w+)\s*\(',  # function functionName(
+        r'(\w+)\(\)\s*function',  # functionName() function
+        r'the\s+(\w+)\(\)\s*function',  # the functionName() function
+        r'(\w+)\(\)\s*(?:method|call|routine)',  # functionName() method/call/routine
+        
+        # More specific function call patterns
+        r'call(?:s|ing)?\s+(\w+)\s*\(',  # call/calls/calling functionName(
+        r'invoke(?:s|ing)?\s+(\w+)\s*\(',  # invoke/invokes/invoking functionName(
+        r'execute(?:s|ing)?\s+(\w+)\s*\(',  # execute/executes/executing functionName(
+        r'trigger(?:s|ing)?\s+(\w+)\s*\(',  # trigger/triggers/triggering functionName(
+        
+        # Function mentions with temporal indicators
+        r'(\w+)\(\)\s*(?:first|then|afterward|before|after)',  # functionName() first/then/etc
+        r'(?:first|then|afterward|before|after)\s+(\w+)\s*\(',  # first/then functionName(
+        
+        # Function mentions with modal verbs (more specific)
+        r'(\w+)\(\)\s*(?:will|should|must|may|might)\s+',  # functionName() will/should/etc
+        r'(?:will|should|must|may|might)\s+(\w+)\s*\(',  # will/should functionName(
+        
+        # Function mentions with negation
+        r'(\w+)\(\)\s*(?:does not|doesn\'t|cannot|can\'t)',  # functionName() does not/etc
+        r'(?:does not|doesn\'t|cannot|can\'t)\s+(\w+)\s*\(',  # does not functionName(
+        
+        # Internal/private functions (often prefixed with _)
+        r'_(\w+)\s*\(',  # _functionName(
+        r'(\w+)\._(\w+)\s*\(',  # contract._functionName(
+        
+        # Solidity-specific patterns
+        r'\.(\w+)\s*\(\)',  # .functionName() - method calls
+        r'(\w+)\.(\w+)\s*\(',  # contract.functionName( - external calls
+        
+        # Function mentions in error/revert contexts
+        r'(?:in|during|when)\s+(\w+)\s*\(',  # in/during/when functionName(
+        r'(\w+)\(\)\s*(?:reverts?|fails?|errors?)',  # functionName() reverts/fails/errors
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            # Handle tuple matches (some patterns capture multiple groups)
+            if isinstance(match, tuple):
+                for submatch in match:
+                    if submatch and len(submatch) > 2 and submatch.lower() not in EXCLUDE_WORDS:
+                        # Additional validation: should look like a function name
+                        if is_valid_function_name(submatch):
+                            function_names.add(submatch)
+            else:
+                if match and len(match) > 2 and match.lower() not in EXCLUDE_WORDS:
+                    if is_valid_function_name(match):
+                        function_names.add(match)
+    
+    return function_names
+
+def is_valid_function_name(name: str) -> bool:
+    """Validate if a string looks like a valid function name."""
+    if not name or len(name) < 3:
+        return False
+    
+    # Must start with letter or underscore
+    if not (name[0].isalpha() or name[0] == '_'):
+        return False
+    
+    # Can only contain alphanumeric characters and underscores
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+        return False
+    
+    # Exclude common programming keywords and types
+    KEYWORDS = {
+        'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default',
+        'break', 'continue', 'return', 'try', 'catch', 'throw', 'finally',
+        'class', 'struct', 'enum', 'union', 'typedef', 'sizeof', 'typeof',
+        'true', 'false', 'null', 'undefined', 'void', 'var', 'let', 'const'
+    }
+    
+    if name.lower() in KEYWORDS:
+        return False
+    
+    # Exclude very common English words that might appear in code contexts
+    COMMON_WORDS = {
+        'user', 'data', 'info', 'type', 'size', 'length', 'count', 'index',
+        'value', 'item', 'list', 'array', 'map', 'key', 'name', 'text',
+        'code', 'file', 'path', 'url', 'link', 'page', 'view', 'form'
+    }
+    
+    if name.lower() in COMMON_WORDS and len(name) <= 5:
+        return False
+    
+    return True
+
+def calculate_function_match_score(bug_report: Dict, file_content: str) -> tuple[float, List[str]]:
+    """Calculate score based on function name matches with improved extraction."""
+    match_reasons = []
+    max_score = 0.0
+    
+    # Extract function names from title and description
+    title = bug_report.get('title', '')
+    description = bug_report.get('description', '')
+    
+    all_text = f"{title} {description}"
+    
+    mentioned_functions = extract_function_names_from_text(all_text)
+    
+    # Also extract from code snippets
+    snippets = extract_code_snippets(bug_report)
+    for snippet in snippets:
+        snippet_functions = extract_function_names_from_text(snippet)
+        mentioned_functions.update(snippet_functions)
+        
+        # Extract function calls from code with better patterns
+        func_call_patterns = [
+            r'(\w+)\s*\(',  # Basic function call
+            r'\.(\w+)\s*\(',  # Method call
+            r'(\w+)\.(\w+)\s*\(',  # Contract.function call
+        ]
+        
+        for pattern in func_call_patterns:
+            func_calls = re.findall(pattern, snippet)
+            for call in func_calls:
+                if isinstance(call, tuple):
+                    for subcall in call:
+                        if subcall and is_valid_function_name(subcall):
+                            mentioned_functions.add(subcall)
+                else:
+                    if is_valid_function_name(call):
+                        mentioned_functions.add(call)
+    
+    print(f"    Extracted function names: {mentioned_functions}")
+    
+    # Check for function definitions and calls in file
+    for func_name in mentioned_functions:
+        found_match = False
+        
+        # Check for function definition (highest score)
+        def_patterns = [
+            rf'function\s+{re.escape(func_name)}\s*\(',
+            rf'{re.escape(func_name)}\s*\([^)]*\)\s*(?:public|private|internal|external)',
+            rf'function\s+{re.escape(func_name)}\b',  # Function declaration without immediate (
+        ]
+        
+        for pattern in def_patterns:
+            if re.search(pattern, file_content, re.IGNORECASE):
+                max_score = max(max_score, 95.0)
+                match_reasons.append(f"Function definition found: {func_name}")
+                found_match = True
                 break
-            elif similarity > 70:  # Somewhat similar
-                max_score = max(max_score, 120.0)
-                match_reasons.append(f"Fuzzy filename match: {word} ≈ {filename_stem}")
-                print(f"      ✓ Fuzzy filename match: {word} (similarity: {similarity}%)")
-                break
+        
+        # Check for function calls (medium score)
+        if not found_match:
+            call_patterns = [
+                rf'\b{re.escape(func_name)}\s*\(',  # Direct function call
+                rf'\.{re.escape(func_name)}\s*\(',  # Method call
+                rf'{re.escape(func_name)}\s*\(\s*\)',  # Function call with empty params
+            ]
+            for pattern in call_patterns:
+                if re.search(pattern, file_content, re.IGNORECASE):
+                    max_score = max(max_score, 70.0)
+                    match_reasons.append(f"Function call found: {func_name}")
+                    found_match = True
+                    break
+        
+        # Check for simple mention only if it's a longer, distinctive name
+        if not found_match and len(func_name) >= 6:
+            # Use word boundaries to avoid substring matches
+            if re.search(rf'\b{re.escape(func_name)}\b', file_content, re.IGNORECASE):
+                max_score = max(max_score, 40.0)
+                match_reasons.append(f"Function mentioned: {func_name}")
     
     return max_score, match_reasons
 
 def extract_function_names_from_description(bug_report: Dict) -> Set[str]:
     """
     Extract function names from bug report description that have () after them.
-    
-    Args:
-        bug_report: Dictionary containing bug report data
-    
-    Returns:
-        Set of function names found in the description
+    Uses the improved extraction logic.
     """
-    function_names = set()
-    
-    # Get description text
     description = bug_report.get('description', '')
     if not description:
-        return function_names
+        return set()
     
-    # Enhanced patterns for function mentions with parentheses
-    patterns = [
-        r'(\w+)\(\)\s*function',  # functionName() function
-        r'the\s+(\w+)\(\)\s*function',  # the functionName() function
-        r'function\s+(\w+)\(',  # function functionName(
-        r'(\w+)\(\)',  # functionName() - basic pattern
-        r'In\s+the\s+(\w+)\(\)\s*function',  # In the functionName() function
-        r'call\s+(\w+)\(',  # call functionName(
-        r'calls?\s+(\w+)\(\)',  # call/calls functionName()
-        r'(\w+)\(\)\s*(?:method|call)',  # functionName() method/call
-        r'(\w+)\(\)\s*(?:first|afterward|then)',  # functionName() first/afterward/then
-        r'invoke\s+(\w+)\(',  # invoke functionName(
-        r'execute\s+(\w+)\(',  # execute functionName(
-        r'(\w+)\(\)\s*(?:is|are)\s+being',  # functionName() is being
-        r'(\w+)\(\)\s*(?:does not|doesn\'t)',  # functionName() does not
-        r'(\w+)\(\)\s*can\s+',  # functionName() can
-        r'(\w+)\(\)\s*will\s+',  # functionName() will
-        r'_(\w+)\(\)',  # _functionName() - internal functions
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, description, re.IGNORECASE)
-        for match in matches:
-            # Filter out common words and ensure it looks like a function name
-            if (len(match) > 2 and 
-                match.isalpha() and 
-                match.lower() not in {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'when', 'where', 'what', 'how', 'can', 'will', 'does', 'not', 'are', 'being'}):
-                function_names.add(match)
-    
-    return function_names
-    """Extract function names mentioned in text descriptions."""
-    function_names = set()
-    
-    # Common patterns for function mentions in descriptions
-    patterns = [
-        r'(\w+)\(\)\s*function',  # functionName() function
-        r'the\s+(\w+)\(\)\s*function',  # the functionName() function
-        r'function\s+(\w+)\(',  # function functionName(
-        r'_(\w+)\(\)',  # _functionName()
-        r'(\w+)\(\)\s*(?:method|call)',  # functionName() method/call
-        r'call\s+(\w+)\(',  # call functionName(
-        r'calls?\s+(\w+)\(\)',  # call/calls functionName()
-        r'(\w+)\(\)\s*(?:first|afterward|then)',  # functionName() first/afterward/then
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        function_names.update(m for m in matches if len(m) > 2 and m.isalpha())
-    
-    return function_names
+    return extract_function_names_from_text(description)
 
 def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: str, max_results: int = 10) -> List[Dict]:
     """
@@ -667,7 +1012,7 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
         
         # 1. GitHub Search Boost (HIGHEST PRIORITY)
         if file_path in github_search_matches:
-            github_boost_score = 300.0  # Huge boost!
+            github_boost_score = 200.0  # Huge boost!
             total_score += github_boost_score
             match_reasons.append("GitHub search found exact code snippet match")
             score_breakdown['github_search_boost'] = github_boost_score

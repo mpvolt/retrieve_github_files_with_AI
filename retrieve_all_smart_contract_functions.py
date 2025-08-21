@@ -19,7 +19,7 @@ import requests
 from urllib.parse import urlparse, unquote
 from typing import List, Optional
 from pathlib import Path  # Added missing import
-
+import time
 
 # Supported smart contract file extensions
 SMART_CONTRACT_EXTENSIONS = ('.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
@@ -99,8 +99,10 @@ def fetch_file_content(owner: str, repo: str, path: str, ref: str, api_key: str)
         if hasattr(e.response, 'status_code'):
             if e.response.status_code == 404:
                 print(f"File {path} not found in {owner}/{repo} at ref {ref}")
-            elif e.response.status_code == 403:
-                print("API rate limit exceeded or insufficient permissions")
+            elif e.response.status_code == 403 and 'rate limit' in e.response.text.lower():
+                print("API rate limit exceeded")
+                time.sleep(60)
+                fetch_file_content(owner, repo, path, ref, api_key)
         return None
 
 def extract_function_names(blob_url: str, api_key: Optional[str] = None) -> List[str]:

@@ -43,7 +43,8 @@ class GitHubAPIHandler:
         """
         if not self.check_rate_limit():
             print("Rate limit exceeded!")
-            return None
+            time.sleep(60)
+            get_compare_files(owner, repo, base, head)
             
         url = f"{self.base_url}/repos/{owner}/{repo}/compare/{base}...{head}"
         
@@ -111,9 +112,10 @@ class GitHubAPIHandler:
             elif response.status_code == 404:
                 print(f"✗ Comparison not found (404)")
                 return None
-            elif response.status_code == 403:
-                print(f"✗ API access forbidden (403). Check your API key or rate limits")
-                return None
+            elif response.status_code == 403 and 'rate limit' in response.text.lower():
+                print(f"Rate limit exceeded")
+                time.sleep(60)
+                self.get_compare_files(owner, repo, base, head)
             else:
                 print(f"✗ API request failed with status {response.status_code}: {response.text}")
                 return None
@@ -142,7 +144,9 @@ class GitHubAPIHandler:
         Get specific file content at a specific commit via GitHub API
         """
         if not self.check_rate_limit():
-            return None
+            print("Rate limit exceeded")
+            time.sleep(60)
+            self.get_file_content(owner, repo, commit_hash, file_path)
             
         url = f"{self.base_url}/repos/{owner}/{repo}/contents/{file_path}"
         
