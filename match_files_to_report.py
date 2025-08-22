@@ -96,15 +96,15 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
         # Parse the blob URL to extract repo info and file path
         # Example: https://github.com/owner/repo/blob/branch/path/to/file.sol
         parts = blob_url.replace('https://github.com/', '').split('/')
-        if len(parts) < 4:
+        if len(parts) < 4 or parts[2] != 'blob':
             return ""
         
         owner = parts[0]
         repo = parts[1]
-        # Skip 'blob' and branch name
-        file_path = '/'.join(parts[4:])  # Everything after owner/repo/blob/branch
+        ref = parts[3]  # branch or commit hash
+        file_path = '/'.join(parts[4:])  # Everything after owner/repo/blob/ref
         
-        # Use GitHub API to get file content
+        # Use GitHub API to get file content with explicit ref parameter
         api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
         
         headers = {
@@ -113,10 +113,12 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
             'User-Agent': 'File-Matcher/1.0'
         }
         
+        params = {'ref': ref}
+        
         # Retry loop for rate limiting
         max_retries = 10
         for attempt in range(max_retries):
-            response = requests.get(api_url, headers=headers)
+            response = requests.get(api_url, headers=headers, params=params)
             
             # Check if we hit rate limit (status code 403 with rate limit message)
             if response.status_code == 403:
@@ -125,12 +127,15 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
                     print(f"Rate limit exceeded. Waiting 60 seconds before retry (attempt {attempt + 1}/{max_retries})...")
                     if attempt < max_retries - 1:  # Don't wait on the last attempt
                         time.sleep(60)
-                        get_file_path_from_blob_url(blob_url, api_key)
-                    
+                        continue  # Continue to next iteration instead of recursive call
             
-            # If successful or other error, break the retry loop
+            # If successful, break the retry loop
+            if response.status_code == 200:
+                break
+                
+            # For other errors, raise immediately
             response.raise_for_status()
-            break
+            
         else:
             # This else clause executes if the loop completed without breaking
             # (meaning all retries failed due to rate limiting)
@@ -144,29 +149,12 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
         
     except Exception as e:
         print(f"Error fetching content from {blob_url}: {e}")
-        # Fallback to raw URL method
+        # Fallback to raw URL method (no rate limiting needed for raw URLs)
         try:
             raw_url = blob_url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
-            
-            # Apply rate limiting to fallback method as well
-            max_retries = 10
-            for attempt in range(max_retries):
-                response = requests.get(raw_url)
-                
-                # Check for rate limiting on raw URL (GitHub also rate limits raw requests)
-                if response.status_code == 403:
-                    print(f"Rate limit on fallback method. Waiting 60 seconds (attempt {attempt + 1}/{max_retries})...")
-                    if attempt < max_retries - 1:
-                        time.sleep(60)
-                        get_file_content_from_blob_url(blob_url, api_key)
-                    else:
-                        print("Max retries reached for fallback method.")
-                        break
-                
-                response.raise_for_status()
-                return response.text
-            else:
-                raise Exception("Fallback method failed after maximum retries")
+            response = requests.get(raw_url, timeout=30)
+            response.raise_for_status()
+            return response.text
                 
         except Exception as e2:
             print(f"Fallback method also failed: {e2}")
@@ -204,12 +192,45 @@ def extract_code_snippets(bug_report: Dict) -> List[str]:
     
     return snippets
 
+def is_valid_function_name(name: str) -> bool:
+    """Check if a string looks like a valid function name."""
+    if not name:
+        return False
+    
+    # Should start with letter or underscore
+    if not (name[0].isalpha() or name[0] == '_'):
+        return False
+    
+    # Should only contain alphanumeric characters and underscores
+    if not name.replace('_', '').isalnum():
+        return False
+    
+    # Should not be all uppercase (likely a constant)
+    if name.isupper() and len(name) > 3:
+        return False
+    
+    return True
+
 def extract_function_names_from_text(text: str) -> Set[str]:
-    """Extract function names mentioned in text descriptions."""
+    """Extract function names mentioned in text descriptions with better filtering."""
     function_names = set()
     
-    # Common patterns for function mentions in descriptions
-    patterns = [
+    # Common words that should NOT be considered function names
+    EXCLUDE_WORDS = {
+        'the', 'and', 'for', 'with', 'from', 'this', 'that', 'when', 'where', 
+        'what', 'how', 'can', 'will', 'does', 'not', 'are', 'being', 'have',
+        'has', 'had', 'said', 'get', 'set', 'new', 'old', 'way', 'use', 'call',
+        'view', 'pure', 'true', 'false', 'null', 'void', 'int', 'uint', 'bool',
+        'string', 'address', 'bytes', 'mapping', 'array', 'struct', 'enum',
+        'public', 'private', 'internal', 'external', 'constant', 'immutable',
+        'override', 'virtual', 'abstract', 'interface', 'contract', 'library',
+        'function', 'modifier', 'event', 'error', 'using', 'import', 'pragma',
+        'require', 'assert', 'revert', 'emit', 'return', 'if', 'else', 'while',
+        'for', 'do', 'break', 'continue', 'try', 'catch', 'throw', 'finally'
+    }
+    
+    # Start with the simple, working patterns from your first function
+    simple_patterns = [
         r'(\w+)\(\)\s*function',  # functionName() function
         r'the\s+(\w+)\(\)\s*function',  # the functionName() function
         r'function\s+(\w+)\(',  # function functionName(
@@ -221,9 +242,39 @@ def extract_function_names_from_text(text: str) -> Set[str]:
         r'(\w+)\s+functions?',  # functionName function/functions
     ]
     
-    for pattern in patterns:
+    # Process simple patterns first
+    for pattern in simple_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
-        function_names.update(m for m in matches if len(m) > 2 and m.isalpha())
+        for match in matches:
+            if match and len(match) > 2 and match.lower() not in EXCLUDE_WORDS:
+                if is_valid_function_name(match):
+                    function_names.add(match)
+    
+    # If we found functions with simple patterns, return them
+    if function_names:
+        return function_names
+    
+    # Only try complex patterns if simple patterns didn't work
+    complex_patterns = [
+        r'call(?:s|ing)?\s+(\w+)\s*\(',  # call/calls/calling functionName(
+        r'invoke(?:s|ing)?\s+(\w+)\s*\(',  # invoke/invokes/invoking functionName(
+        r'execute(?:s|ing)?\s+(\w+)\s*\(',  # execute/executes/executing functionName(
+        r'trigger(?:s|ing)?\s+(\w+)\s*\(',  # trigger/triggers/triggering functionName(
+        r'(?:first|then|afterward|before|after)\s+(\w+)\s*\(',  # first/then functionName(
+        r'(?:will|should|must|may|might)\s+(\w+)\s*\(',  # will/should functionName(
+        r'(?:does not|doesn\'t|cannot|can\'t)\s+(\w+)\s*\(',  # does not functionName(
+        r'_(\w+)\s*\(',  # _functionName(
+        r'\.(\w+)\s*\(\)',  # .functionName() - method calls
+        r'(?:in|during|when)\s+(\w+)\s*\(',  # in/during/when functionName(
+        r'(\w+)\(\)\s*(?:reverts?|fails?|errors?)',  # functionName() reverts/fails/errors
+    ]
+    
+    for pattern in complex_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            if match and len(match) > 2 and match.lower() not in EXCLUDE_WORDS:
+                if is_valid_function_name(match):
+                    function_names.add(match)
     
     return function_names
 
@@ -231,22 +282,95 @@ def extract_variable_names_from_text(text: str) -> Set[str]:
     """Extract variable names mentioned in text descriptions."""
     variable_names = set()
     
-    # Common patterns for variable mentions
+    # Common words that should NOT be considered variable names
+    EXCLUDE_WORDS = {
+        'the', 'and', 'for', 'with', 'from', 'this', 'that', 'when', 'where', 
+        'what', 'how', 'can', 'will', 'does', 'not', 'are', 'being', 'have',
+        'has', 'had', 'said', 'get', 'set', 'new', 'old', 'way', 'use', 'call',
+        'user', 'owner', 'admin', 'contract', 'address', 'amount', 'value',
+        'balance', 'fee', 'fees', 'token', 'tokens', 'transfer', 'transfers',
+        'current', 'total', 'minimum', 'maximum', 'result', 'error', 'true', 
+        'false', 'null', 'void', 'public', 'private', 'internal', 'external'
+    }
+    
+    # Enhanced patterns for variable mentions
     patterns = [
-        r'the\s+(\w+)\s+value',  # the variableName value
+        # Direct variable references with context
+        r'the\s+(\w+)\s+(?:value|amount|variable|field)',  # the variableName value/amount/variable/field
         r'(\w+)\s+(?:is|are)\s+being',  # variableName is being
         r'(\w+)\s+(?:does not|doesn\'t)',  # variableName does not
-        r'balances\[_user\]\.(\w+)',  # balances[_user].fieldName
+        
+        # Assignment patterns
         r'(\w+)\s*=\s*',  # variableName =
-        r'(\w+)\s*/\s*100',  # variableName / 100
+        r'set\s+(\w+)\s+to',  # set variableName to
+        r'(\w+)\s+(?:is|was)\s+set\s+to',  # variableName is/was set to
+        
+        # Mathematical operations
+        r'(\w+)\s*/\s*\d+',  # variableName / 100
         r'(\w+)\s*\*\s*\w+',  # variableName * something
+        r'(\w+)\s*[+\-]\s*\w+',  # variableName + something or variableName - something
+        
+        # Comparison patterns
+        r'(\w+)\s*(?:>=|<=|>|<|==|!=)\s*',  # variableName >= something
+        r'(?:>=|<=|>|<|==|!=)\s*(\w+)',  # >= variableName
+        r'than\s+(?:the\s+)?(\w+)\s+(?:amount|value)',  # than the variableName amount
+        
+        # Solidity-specific patterns
+        r'balances\[.*?\]\.(\w+)',  # balances[user].fieldName
+        r'(\w+)\[.*?\]',  # variableName[index] - mapping/array access
+        r'\.(\w+)\s+(?:amount|value|balance)',  # .variableName amount/value/balance
+        
+        # Variable mentions with underscores (common in Solidity)
+        r'(?:the\s+)?(_\w+)\s+(?:amount|value|variable|field)',  # the _variableName amount
+        r'(?:current|total|minimum|maximum)\s+(_\w+)',  # current _variableName
+        r'(_\w+)\s+(?:is|are|was|were)',  # _variableName is/are/was/were
+        
+        # Fee-specific patterns (since your example is about fees)
+        r'(\w*[Ff]ees?)\s+(?:amount|value)',  # fees/Fees amount
+        r'(?:pay|paying|paid)\s+(?:a\s+)?(?:higher\s+)?(\w*[Ff]ees?)',  # pay higher fees
+        r'(?:the\s+)?(\w*[Ff]ees?)\s+(?:than|amount)',  # the fees than
+        
+        # Generic variable context patterns
+        r'(?:the\s+)?(\w+)\s+(?:parameter|property|attribute)',  # the variableName parameter
+        r'(\w+)\s+(?:contains|holds|stores)',  # variableName contains/holds/stores
+        r'(?:update|updates|updating)\s+(?:the\s+)?(\w+)',  # update the variableName
+        r'(?:modify|modifies|modifying)\s+(?:the\s+)?(\w+)',  # modify the variableName
     ]
     
     for pattern in patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
-        variable_names.update(m for m in matches if len(m) > 2)
+        for match in matches:
+            # Clean up the match
+            clean_match = match.strip()
+            
+            # Basic validation
+            if (clean_match and 
+                len(clean_match) > 1 and  # Allow shorter variable names like 'x', 'i'
+                clean_match.lower() not in EXCLUDE_WORDS and
+                is_valid_variable_name(clean_match)):
+                variable_names.add(clean_match)
     
     return variable_names
+
+def is_valid_variable_name(name: str) -> bool:
+    """Check if a string looks like a valid variable name."""
+    if not name:
+        return False
+    
+    # Should start with letter or underscore
+    if not (name[0].isalpha() or name[0] == '_'):
+        return False
+    
+    # Should only contain alphanumeric characters and underscores
+    if not name.replace('_', '').isalnum():
+        return False
+    
+    # Should not be all uppercase with length > 3 (likely a constant)
+    if name.isupper() and len(name) > 3:
+        return False
+    
+    return True
+
 
 def calculate_code_similarity(snippet: str, file_content: str) -> float:
     """Calculate similarity between code snippet and file content."""
@@ -348,7 +472,8 @@ def calculate_variable_match_score(bug_report: Dict, file_content: str) -> tuple
     # Extract variable names from title and description
     title = bug_report.get('title', '')
     description = bug_report.get('description', '')
-    all_text = f"{title} {description}"
+    recommendation = bug_report.get('recommendation', '')
+    all_text = f"{title} {description} {recommendation}"
     
     mentioned_variables = extract_variable_names_from_text(all_text)
     
@@ -360,10 +485,12 @@ def calculate_variable_match_score(bug_report: Dict, file_content: str) -> tuple
         
         # Extract variable assignments and references
         var_patterns = [
-            r'(\w+)\s*=\s*',
-            r'balances\[_user\]\.(\w+)',
-            r'(\w+)\s*\*\s*\w+',
-            r'(\w+)\s*/\s*\d+',
+            r'([a-zA-Z_]\w*)\s*=\s*',
+            r'balances\[_user\]\.([a-zA-Z_]\w*)',
+            r'([a-zA-Z_]\w*)\s*\*\s*\w+',
+            r'([a-zA-Z_]\w*)\s*/\s*\d+',
+            r'\b([A-Z_][A-Z0-9_]*)\b',  # CONSTANT_STYLE variables
+            r'\b([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\b',  # camelCase variables
         ]
         for pattern in var_patterns:
             matches = re.findall(pattern, snippet)
@@ -376,11 +503,14 @@ def calculate_variable_match_score(bug_report: Dict, file_content: str) -> tuple
         if var_name.lower() in file_content.lower():
             # Check if it's a proper variable usage (not just substring)
             var_patterns = [
-                rf'\b{re.escape(var_name)}\s*=',
-                rf'\b{re.escape(var_name)}\s*\*',
-                rf'\b{re.escape(var_name)}\s*/',
-                rf'\.{re.escape(var_name)}\b',
-                rf'\b{re.escape(var_name)}\b'
+                r'([a-zA-Z_]\w*)\s*=\s*',
+                r'balances\[_user\]\.([a-zA-Z_]\w*)',
+                r'([a-zA-Z_]\w*)\s*\*\s*\w+',
+                r'([a-zA-Z_]\w*)\s*/\s*\d+',
+                r'\b([A-Z_][A-Z0-9_]*)\b',  # CONSTANT_STYLE variables
+                r'\b([a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*)\b',  # camelCase variables
+                r'\b([A-Z][a-z][a-zA-Z0-9]*)\b',  # PascalCase variables like "Amount"
+                r'\b([a-z]+)\s*[-+*/]\s*',  # simple lowercase vars in expressions
             ]
             for pattern in var_patterns:
                 if re.search(pattern, file_content, re.IGNORECASE):
@@ -689,80 +819,7 @@ def calculate_filename_mention_score(bug_report: Dict, file_path: str) -> tuple[
                 print(f"      ✓ Compound words found: {word_details} (score: {compound_score:.1f})")
     
     return max_score, match_reasons
-    
-def extract_function_names_from_text(text: str) -> Set[str]:
-    """Extract function names mentioned in text descriptions with better filtering."""
-    function_names = set()
-    
-    # Common words that should NOT be considered function names
-    EXCLUDE_WORDS = {
-        'the', 'and', 'for', 'with', 'from', 'this', 'that', 'when', 'where', 
-        'what', 'how', 'can', 'will', 'does', 'not', 'are', 'being', 'have',
-        'has', 'had', 'said', 'get', 'set', 'new', 'old', 'way', 'use', 'call',
-        'view', 'pure', 'true', 'false', 'null', 'void', 'int', 'uint', 'bool',
-        'string', 'address', 'bytes', 'mapping', 'array', 'struct', 'enum',
-        'public', 'private', 'internal', 'external', 'constant', 'immutable',
-        'override', 'virtual', 'abstract', 'interface', 'contract', 'library',
-        'function', 'modifier', 'event', 'error', 'using', 'import', 'pragma',
-        'require', 'assert', 'revert', 'emit', 'return', 'if', 'else', 'while',
-        'for', 'do', 'break', 'continue', 'try', 'catch', 'throw', 'finally'
-    }
-    
-    # Enhanced patterns for function mentions with better context
-    patterns = [
-        # Function definitions and calls with clear indicators
-        r'function\s+(\w+)\s*\(',  # function functionName(
-        r'(\w+)\(\)\s*function',  # functionName() function
-        r'the\s+(\w+)\(\)\s*function',  # the functionName() function
-        r'(\w+)\(\)\s*(?:method|call|routine)',  # functionName() method/call/routine
-        
-        # More specific function call patterns
-        r'call(?:s|ing)?\s+(\w+)\s*\(',  # call/calls/calling functionName(
-        r'invoke(?:s|ing)?\s+(\w+)\s*\(',  # invoke/invokes/invoking functionName(
-        r'execute(?:s|ing)?\s+(\w+)\s*\(',  # execute/executes/executing functionName(
-        r'trigger(?:s|ing)?\s+(\w+)\s*\(',  # trigger/triggers/triggering functionName(
-        
-        # Function mentions with temporal indicators
-        r'(\w+)\(\)\s*(?:first|then|afterward|before|after)',  # functionName() first/then/etc
-        r'(?:first|then|afterward|before|after)\s+(\w+)\s*\(',  # first/then functionName(
-        
-        # Function mentions with modal verbs (more specific)
-        r'(\w+)\(\)\s*(?:will|should|must|may|might)\s+',  # functionName() will/should/etc
-        r'(?:will|should|must|may|might)\s+(\w+)\s*\(',  # will/should functionName(
-        
-        # Function mentions with negation
-        r'(\w+)\(\)\s*(?:does not|doesn\'t|cannot|can\'t)',  # functionName() does not/etc
-        r'(?:does not|doesn\'t|cannot|can\'t)\s+(\w+)\s*\(',  # does not functionName(
-        
-        # Internal/private functions (often prefixed with _)
-        r'_(\w+)\s*\(',  # _functionName(
-        r'(\w+)\._(\w+)\s*\(',  # contract._functionName(
-        
-        # Solidity-specific patterns
-        r'\.(\w+)\s*\(\)',  # .functionName() - method calls
-        r'(\w+)\.(\w+)\s*\(',  # contract.functionName( - external calls
-        
-        # Function mentions in error/revert contexts
-        r'(?:in|during|when)\s+(\w+)\s*\(',  # in/during/when functionName(
-        r'(\w+)\(\)\s*(?:reverts?|fails?|errors?)',  # functionName() reverts/fails/errors
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        for match in matches:
-            # Handle tuple matches (some patterns capture multiple groups)
-            if isinstance(match, tuple):
-                for submatch in match:
-                    if submatch and len(submatch) > 2 and submatch.lower() not in EXCLUDE_WORDS:
-                        # Additional validation: should look like a function name
-                        if is_valid_function_name(submatch):
-                            function_names.add(submatch)
-            else:
-                if match and len(match) > 2 and match.lower() not in EXCLUDE_WORDS:
-                    if is_valid_function_name(match):
-                        function_names.add(match)
-    
-    return function_names
+
 
 def is_valid_function_name(name: str) -> bool:
     """Validate if a string looks like a valid function name."""
@@ -941,6 +998,9 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
             if not github_search_matches and not search_performed:
                 print("No code snippets found, searching for function names in description...")
                 function_names = extract_function_names_from_description(bug_report)
+
+                print(f"Raw function_names result: {function_names}")  # Add this
+                print(f"Function_names type: {type(function_names)}")  # Add this
                 
                 if function_names:
                     print(f"Found function names in description: {list(function_names)}")
@@ -961,6 +1021,10 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
             elif not github_search_matches and search_performed:
                 print("No results from code snippet search, trying function names...")
                 function_names = extract_function_names_from_description(bug_report)
+
+                print(f"🔍 DEBUG: Raw function_names result: {function_names}")
+                print(f"🔍 DEBUG: Function_names type: {type(function_names)}")
+                print(f"🔍 DEBUG: Function_names size: {len(function_names)}")
                 
                 if function_names:
                     print(f"Found function names in description: {list(function_names)}")
@@ -1027,11 +1091,11 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
             print(f"    Filename mention score: {filename_score:.1f}")
         
         # 3. Language match
-        lang_score, lang_reasons = calculate_language_match_score(bug_report, file_path)
-        if lang_score > 0:
-            total_score += lang_score
-            match_reasons.extend(lang_reasons)
-            score_breakdown['language'] = lang_score
+        # lang_score, lang_reasons = calculate_language_match_score(bug_report, file_path)
+        # if lang_score > 0:
+        #     total_score += lang_score
+        #     match_reasons.extend(lang_reasons)
+        #     score_breakdown['language'] = lang_score
         
         # 4. Code snippet similarity
         if code_snippets:

@@ -165,16 +165,24 @@ def process_json_files_with_rate_limiting():
         for json_file in json_files:
             try:
                 # Convert Path object to absolute string path for cross-platform compatibility
-                # This handles spaces in filenames and ensures consistent path format
                 json_file_str = str(json_file.resolve())
                 
                 logger.info(f"Processing file {processed_count + 1}/{len(json_files)}: {json_file}")
                 logger.debug(f"Resolved path: {json_file_str}")
                 
-                # Verify we're still in the correct working directory
-                if os.getcwd() != original_cwd:
-                    logger.warning(f"Working directory changed, restoring to {original_cwd}")
-                    os.chdir(original_cwd)
+                # Safely verify and restore working directory
+                try:
+                    current_dir = os.getcwd()
+                    if current_dir != original_cwd:
+                        logger.warning(f"Working directory changed, restoring to {original_cwd}")
+                        os.chdir(original_cwd)
+                except FileNotFoundError:
+                    logger.warning("Current working directory no longer exists, restoring to original")
+                    if os.path.exists(original_cwd):
+                        os.chdir(original_cwd)
+                    else:
+                        logger.error(f"Original directory {original_cwd} also missing, using home directory")
+                        os.chdir(os.path.expanduser('~'))
                 
                 # Check rate limit before processing each file
                 if not rate_manager.check_and_wait_if_needed(f"before processing {json_file}"):
@@ -191,8 +199,7 @@ def process_json_files_with_rate_limiting():
                     failed_count += 1
                     continue
                 
-                # Process the file - this is where analyze_relevant_files() gets called
-                # and where it might make GitHub API requests
+                # Process the file
                 max_retries = 3
                 retry_count = 0
                 
@@ -202,16 +209,21 @@ def process_json_files_with_rate_limiting():
                         if not rate_manager.check_and_wait_if_needed(f"during processing {json_file}"):
                             raise Exception("Rate limit check failed")
                         
-                        # Ensure we're still in the correct directory before processing
-                        if os.getcwd() != original_cwd:
-                            logger.warning(f"Working directory changed during processing, restoring to {original_cwd}")
-                            os.chdir(original_cwd)
+                        # Safely ensure we're still in the correct directory
+                        try:
+                            current_dir = os.getcwd()
+                            if current_dir != original_cwd:
+                                logger.warning(f"Working directory changed during processing, restoring to {original_cwd}")
+                                os.chdir(original_cwd)
+                        except FileNotFoundError:
+                            logger.warning("Working directory missing during processing, restoring to original")
+                            if os.path.exists(original_cwd):
+                                os.chdir(original_cwd)
                         
                         # Call analyze_relevant_files with the resolved string path
-                        # This ensures consistent path handling across Mac/Windows with spaces
                         success = analyze_relevant_files(json_file_str)
                         
-                        if success is not None:  # Check for None specifically
+                        if success is not None:
                             processed_count += 1
                             logger.info(f"Successfully processed {json_file}")
                             break
@@ -225,18 +237,16 @@ def process_json_files_with_rate_limiting():
                         retry_count += 1
                         if retry_count < max_retries:
                             logger.warning(f"Error processing {json_file} (attempt {retry_count}): {e}")
-                            time.sleep(10)  # Wait before retry
+                            time.sleep(10)
                         else:
                             logger.error(f"Failed to process {json_file} after {max_retries} attempts: {e}")
                             failed_count += 1
                             break
                 else:
-                    # We exhausted all retries without success
                     if retry_count >= max_retries:
                         failed_count += 1
                         continue
                 
-                # Small delay between files to be nice to the API
                 time.sleep(0.5)
                 
             except KeyboardInterrupt:
@@ -249,10 +259,17 @@ def process_json_files_with_rate_limiting():
         logger.info(f"Processing complete: {processed_count} successful, {failed_count} failed")
         
     finally:
-        # Always restore the original working directory
-        if os.getcwd() != original_cwd:
-            logger.info(f"Restoring working directory to {original_cwd}")
-            os.chdir(original_cwd)
+        # Safely restore the original working directory
+        try:
+            current_dir = os.getcwd()
+            if current_dir != original_cwd:
+                logger.info(f"Restoring working directory to {original_cwd}")
+                os.chdir(original_cwd)
+        except FileNotFoundError:
+            logger.warning("Cannot restore working directory - it no longer exists")
+            if os.path.exists(original_cwd):
+                os.chdir(original_cwd)
+                logger.info(f"Successfully restored to {original_cwd}")
 
 def main():
     """Entry point for the script"""

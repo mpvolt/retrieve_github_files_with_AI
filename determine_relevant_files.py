@@ -78,145 +78,284 @@ def validate_file_exists(url):
         print(f"  ⚠ Error validating {url}: {e}")
         return False
 
-def get_relevant_files(json_file):
+import json
+from typing import Dict, List, Tuple, Set, Union, Any
+
+
+def load_reports_from_json(json_file: str) -> List[Dict[str, Any]]:
+    """
+    Load and parse JSON file containing report data.
+    
+    Args:
+        json_file: Path to the JSON file
+        
+    Returns:
+        List of report dictionaries
+        
+    Raises:
+        Returns empty list if file cannot be loaded
+    """
     try:
         with open(json_file, "r", encoding="utf-8") as f:
-            reports = json.load(f)  # could be a list
+            reports = json.load(f)
     except (IOError, json.JSONDecodeError) as e:
         print(f"Error reading JSON file: {e}")
-        return {}, []  # Return both empty dict and empty list
+        return []
 
+    # Ensure we always work with a list
     if isinstance(reports, dict):
-        reports = [reports]  # wrap single object in a list
+        reports = [reports]
+    
+    return reports
 
-    # Dictionary to store results with title as key
-    results_dict = {}
 
-    for i, report in enumerate(reports):
-        print(f"\n{'='*50}")
-        report_title = report.get('title', f'Untitled_Report_{i+1}')
-        print(f"Processing report {i+1}: {report_title}")
-        print(f"{'='*50}")
+def validate_report_urls(report: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """
+    Extract and validate source and fix URLs from a report.
+    
+    Args:
+        report: Report dictionary containing URL fields
         
-        # Use a set to track unique file URLs and prevent duplicates for this report
-        relevant_files_set = set()
+    Returns:
+        Tuple of (source_urls, fix_urls) as lists
+    """
+    source_url = report.get("source_code_url")
+    fix_url = report.get("fix_commit_url")
+    
+    # Convert to lists for uniform processing
+    source_urls = source_url if isinstance(source_url, list) else [source_url] if source_url else []
+    fix_urls = fix_url if isinstance(fix_url, list) else [fix_url] if fix_url else []
+    
+    return source_urls, fix_urls
+
+
+def extract_search_data(report: Dict[str, Any]) -> str:
+    """
+    Extract relevant fields from report for semantic search.
+    
+    Args:
+        report: Report dictionary
         
-        # Make a copy to avoid modifying the original
-        report_copy = report.copy()
-        source_url = report_copy.pop("source_code_url", None)
-        fix_url = report_copy.pop("fix_commit_url", None)
+    Returns:
+        JSON string of search-relevant data
+    """
+    search_fields = ['title', 'description', 'recommendation', 'files', 'broken_code_snippets']
+    search_data = {field: report[field] for field in search_fields if field in report}
+    return json.dumps(search_data)
 
-        if not source_url and not fix_url:
-            print("Error: JSON must contain either 'source_code_url' or 'fix_commit_url'.")
-            results_dict[report_title] = []
-            continue
 
-        # Only use title, description, and files fields for search terms
-        search_data = {}
-        if 'title' in report:
-            search_data['title'] = report['title']
-        if 'description' in report:
-            search_data['description'] = report['description'] 
-        if 'recommendation' in report:
-            search_data['recommendation'] = report['recommendation']
-        if 'files' in report:
-            search_data['files'] = report['files']
-        if 'broken_code_snippets' in report:
-            search_data['broken_code_snippets'] = report['broken_code_snippets']
-            
-        search_json_str = json.dumps(search_data)
+def process_source_urls(source_urls: List[str]) -> Set[str]:
+    """
+    Process source code URLs to extract relevant file URLs.
+    
+    Args:
+        source_urls: List of source code URLs to process
         
-        # Convert single URLs to lists for uniform processing
-        source_urls = source_url if isinstance(source_url, list) else [source_url] if source_url else []
-        fix_urls = fix_url if isinstance(fix_url, list) else [fix_url] if fix_url else []
+    Returns:
+        Set of relevant file URLs
+    """
+    relevant_files_set = set()
+    
+    for url in source_urls:
+        print(f"\nSearching source code at: {url}")
+        new_tree = None
+        
+        if 'commit' in url:
+            print("Processing commit url, retrieving new tree and relevant smart contract files")
+            result = handle_commit_files_via_api(url)
+            new_tree = result['newer_tree_url']
+        elif 'pull' in url:
+            print("Processing pull url, retrieving new tree and relevant smart contract files")
+            result = handle_pr_files_via_api(url)
+            new_tree = result['head_tree_info']
+        elif 'compare' in url:
+            print("Processing compare url, retrieving new tree and relevant smart contract files")
+            result = handle_compare_files_via_api(url)
+            new_tree = result['head_tree_url']
+        elif 'tree' in url:
+            print("Already a tree, retrieving smart contract files")
+            new_tree = url
+        elif 'blob' in url:
+            print("Blob detected, doing nothing")
+            relevant_files_set.add(url)
 
-        #If we have a fix_commit_url field, we don't check source commit
-        #Otherwise, we check the source commits
-        if not fix_urls:
-            # Process all source URLs
-            # Retrieve the most recent versions of all files, determine which are relevant semantically
-            for url in source_urls:
-                print(f"\nSearching source code at: {url}")
-                new_tree = None
-                
-                if 'commit' in url:
-                    print("Processing commit url, retrieving new tree and relevant smart contract files")
-                    result = handle_commit_files_via_api(url)
-                    new_tree = result['newer_tree_url']
-                elif 'pull' in url:
-                    print("Processing pull url, retrieving new tree and relevant smart contract files")
-                    result = handle_pr_files_via_api(url)
-                    new_tree = result['head_tree_info']
-                elif 'compare' in url:
-                    print("Processing compare url, retrieving new tree and relevant smart contract files")
-                    result = handle_compare_files_via_api(url)
-                    new_tree = result['head_tree_url']
-                elif 'tree' in url:
-                    print("Already a tree, retrieving smart contract files")
-                    new_tree = url
-                elif 'blob' in url:
-                    print("Blob detected, doing nothing")
-                    relevant_files_set.add(url)
+        if new_tree:
+            # Get all smart contract files and check semantics
+            results = get_smart_contracts(github_url=new_tree, api_key=API_KEY)
+            for file in results['files']:
+                relevant_files_set.add(file['blob_url'])
+    
+    return relevant_files_set
 
-                if new_tree:
-                    #Can't determine relevant files directly from source url
-                    #Need to get all smart contract files and check semantics
-                    results = get_smart_contracts(github_url=new_tree, api_key=API_KEY)
-                    for file in results['files']:
+
+def process_fix_urls(fix_urls: List[str]) -> Set[str]:
+    """
+    Process fix commit URLs to extract changed file URLs.
+    
+    Args:
+        fix_urls: List of fix commit URLs to process
+        
+    Returns:
+        Set of relevant file URLs
+    """
+    relevant_files_set = set()
+    
+    for url in fix_urls:
+        print(f"\nSearching fix commit at: {url}")
+        
+        if 'commit' in url:
+            print("Processing commit url, retrieving changed files")
+            result = handle_commit_files_via_api(url)
+            for file_info in result['files']:
+                relevant_files_set.add(file_info['older_file_url'])
+        elif 'pull' in url:
+            print("Processing pull url, retrieving changed files")
+            result = handle_pr_files_via_api(url)
+            for file_info in result['files']:
+                relevant_files_set.add(file_info['old_blob_url'])
+        elif 'compare' in url:
+            print("Processing compare url, retrieving changed files")
+            result = handle_compare_files_via_api(url)
+            for file_info in result['files']:
+                relevant_files_set.add(file_info['older_file_url'])
+        elif 'tree' in url:
+            print("Processing tree url, relevant smart contract files")
+            result = retrieve_all_smart_contract_files(url)
+            if hasattr(result, 'files') or isinstance(result, dict) and 'files' in result:
+                files = result['files'] if isinstance(result, dict) else result.files
+                for file in files:
+                    if 'blob_url' in file:
                         relevant_files_set.add(file['blob_url'])
-
-        else:
-        # Process all fix URLs
-        # Retrieve only the files that changed (if not tree), determine which are relevant semantically
-
-            for url in fix_urls:
-                print(f"\nSearching fix commit at: {url}")
-                
-                if 'commit' in url:
-                    print("Processing commit url, retrieving changed files")
-                    result = handle_commit_files_via_api(url)
-                    for file_info in result['files']:
-                        relevant_files_set.add(file_info['older_file_url'])
-                elif 'pull' in url:
-                    print("Processing pull url, retrieving changed files")
-                    result = handle_pr_files_via_api(url)
-                    for file_info in result['files']:
-                        relevant_files_set.add(file_info['old_blob_url'])
-                elif 'compare' in url:
-                    print("Processing compare url, retrieving changed files")
-                    result = handle_compare_files_via_api(url)
-                    for file_info in result['files']:
-                        relevant_files_set.add(file_info['older_file_url'])
-                elif 'tree' in url:
-                    print("Processing tree url, relevant smart contract files")
-                    result = retrieve_all_smart_contract_files(url)
-                    if hasattr(result, 'files') or isinstance(result, dict) and 'files' in result:
-                        files = result['files'] if isinstance(result, dict) else result.files
-                        for file in files:
-                            if 'blob_url' in file:
-                                relevant_files_set.add(file['blob_url'])
-                elif 'blob' in url:
-                    print("Blob detected, doing nothing")
-                    relevant_files_set.add(url)
+        elif 'blob' in url:
+            print("Blob detected, doing nothing")
+            relevant_files_set.add(url)
     
-        # Convert set back to list for final use, filtering out test files
-        relevant_files = [f for f in relevant_files_set if ".t." not in f]
+    return relevant_files_set
+
+
+def filter_test_files(file_urls: Set[str]) -> List[str]:
+    """
+    Filter out test files from the set of file URLs.
+    
+    Args:
+        file_urls: Set of file URLs
         
-        for file_url in relevant_files:
-            print(f"  - {file_url}")
+    Returns:
+        List of filtered file URLs (excluding test files)
+    """
+    return [f for f in file_urls if ".t." not in f]
 
-        # Store the results for this report in the dictionary
-        results_dict[report_title] = relevant_files
-
-        #### Do semantic analyis to determine which files are relevant
+def process_single_report(report: Dict[str, Any], report_index: int, processed_urls: Dict[str, List[str]]) -> Tuple[str, List[str]]:
+    """
+    Process a single report to extract relevant files.
     
-    return results_dict, reports  # Return both the files dict AND the reports data
+    Args:
+        report: Report dictionary
+        report_index: Index of the report for naming purposes
+        processed_urls: Dictionary mapping URLs to their cached results
+        
+    Returns:
+        Tuple of (report_title, relevant_files_list)
+    """
+    report_title = report.get('title', f'Untitled_Report_{report_index+1}')
+    print(f"\n{'='*50}")
+    print(f"Processing report {report_index+1}: {report_title}")
+    print(f"{'='*50}")
+    
+    # Validate URLs
+    source_urls, fix_urls = validate_report_urls(report)
+    
+    if not source_urls and not fix_urls:
+        print("Error: JSON must contain either 'source_code_url' or 'fix_commit_url'.")
+        return report_title, []
+    
+    # Extract search data (for future semantic analysis)
+    search_json_str = extract_search_data(report)
+    
+    relevant_files_set = set()
+    
+    # Process fix URLs first (preferred if available)
+    if fix_urls:
+        for fix_url in fix_urls:
+            if fix_url in processed_urls:
+                print(f"Using cached results for fix URL: {fix_url}")
+                relevant_files_set.update(processed_urls[fix_url])
+            else:
+                print(f"Processing fix URL: {fix_url}")
+                new_files = process_fix_urls([fix_url])
+                processed_urls[fix_url] = list(new_files)
+                relevant_files_set.update(new_files)
+        
+        # Fallback to source URLs if no files found from fix URLs
+        if not relevant_files_set and source_urls:
+            for source_url in source_urls:
+                if source_url in processed_urls:
+                    print(f"Using cached results for source URL: {source_url}")
+                    relevant_files_set.update(processed_urls[source_url])
+                else:
+                    print(f"Processing source URL: {source_url}")
+                    new_files = process_source_urls([source_url])
+                    processed_urls[source_url] = list(new_files)
+                    relevant_files_set.update(new_files)
+    else:
+        # Process source URLs if no fix URLs
+        for source_url in source_urls:
+            if source_url in processed_urls:
+                print(f"Using cached results for source URL: {source_url}")
+                relevant_files_set.update(processed_urls[source_url])
+            else:
+                print(f"Processing source URL: {source_url}")
+                new_files = process_source_urls([source_url])
+                processed_urls[source_url] = list(new_files)
+                relevant_files_set.update(new_files)
+    
+    # Filter out test files and convert to list
+    relevant_files = filter_test_files(relevant_files_set)
+    
+    # Print results
+    for file_url in relevant_files:
+        print(f"  - {file_url}")
+    
+    return report_title, relevant_files
+
+
+def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[str, Any]]]:
+    """
+    Main function to process reports and extract relevant files.
+    
+    Args:
+        json_file: Path to JSON file containing reports
+        
+    Returns:
+        Tuple of (results_dict, reports_list) where:
+        - results_dict: Dictionary mapping report titles to lists of relevant file URLs
+        - reports_list: List of original report dictionaries
+    """
+    # Load reports from JSON file
+    reports = load_reports_from_json(json_file)
+    if not reports:
+        return {}, []
+    
+    results_dict = {}
+    processed_urls = {}  # Cache for already processed URLs
+    
+    # Process each report
+    for i, report in enumerate(reports):
+        report_title, relevant_files = process_single_report(report, i, processed_urls)
+        results_dict[report_title] = relevant_files
+    
+    print(f"\n{'='*50}")
+    print(f"Processing complete. Processed {len(processed_urls)} unique URLs.")
+    print("Semantic analysis can be performed next.")
+    print(f"{'='*50}")
+    
+    return results_dict, reports
 
 
     
 
 def main():
-    json_file = "hacken/filtered_[SCA]Hyperlane_InterchainMessageService_Apr2023.json"
+    json_file = "hacken/filtered_[SCA]XPower_ERC20+ERC1155+Staking_Dec2023.json"
 
     # Load JSON file
     results = get_relevant_files(json_file)

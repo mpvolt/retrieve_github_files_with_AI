@@ -423,7 +423,8 @@ class GitHubSmartContractRetriever:
             
         Returns:
             List of dictionaries containing file information
-        """
+        """        
+        
         smart_contract_files = []
         
         # Determine scan root
@@ -445,7 +446,12 @@ class GitHubSmartContractRetriever:
                 continue
             
             # Skip directories we don't want to scan
-            if any(self.should_skip_directory(part) for part in file_path.parts):
+            if any(part in SKIP_DIRECTORIES for part in file_path.parts):
+                continue
+            
+            # Check if file has a smart contract extension
+            file_extension = file_path.suffix.lower()
+            if file_extension not in SMART_CONTRACT_EXTENSIONS:
                 continue
             
             # Validate file path
@@ -462,7 +468,7 @@ class GitHubSmartContractRetriever:
                     print(f"Error: Could not determine relative path for {file_path}")
                 continue
             
-            # Read file content for enhanced detection
+            # Read file content
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
@@ -471,39 +477,47 @@ class GitHubSmartContractRetriever:
                     print(f"Error reading file {file_path}: {e}")
                 continue
             
-            # Check if it's a smart contract file
-            is_contract, language = self.is_smart_contract_file(file_path.name, content)
+            # Get language from extension
+            language = SMART_CONTRACT_EXTENSIONS[file_extension]
             
-            if is_contract:
-                blob_url = self.create_blob_url(owner, repo, branch, str(relative_path))
-                
-                # Additional validation: ensure content is not empty and seems valid
-                content_stripped = content.strip()
-                if len(content_stripped) < 10:  # Skip very short files
+            # Special handling for Python files - check for PyTeal patterns
+            if file_extension == '.py':
+                # Check if it's actually a PyTeal file
+                pyteal_patterns = ['pyteal', 'PyTeal', 'algosdk', 'ApplicationCallTxn', 'Txn.application_id']
+                if not any(pattern in content for pattern in pyteal_patterns):
                     if verbose:
-                        print(f"Skipping very short file: {relative_path}")
+                        print(f"Skipping Python file without PyTeal patterns: {relative_path}")
                     continue
-                
-                # Check for binary content (simplified check)
-                if '\x00' in content[:1000]:  # Check first 1000 chars for null bytes
-                    if verbose:
-                        print(f"Skipping binary file: {relative_path}")
-                    continue
-                
-                smart_contract_files.append({
-                    'name': file_path.name,
-                    'path': str(relative_path),
-                    'content': content,
-                    'blob_url': blob_url,
-                    'size': len(content),
-                    'language': language,
-                    'local_path': str(file_path),
-                    'lines': len(content.splitlines()),
-                    'is_valid': True
-                })
-                
+            
+            # Additional validation: ensure content is not empty and seems valid
+            content_stripped = content.strip()
+            if len(content_stripped) < 10:  # Skip very short files
                 if verbose:
-                    print(f"Found {language} contract: {relative_path} ({len(content)} chars)")
+                    print(f"Skipping very short file: {relative_path}")
+                continue
+            
+            # Check for binary content (simplified check)
+            if '\x00' in content[:1000]:  # Check first 1000 chars for null bytes
+                if verbose:
+                    print(f"Skipping binary file: {relative_path}")
+                continue
+            
+            blob_url = self.create_blob_url(owner, repo, branch, str(relative_path))
+            
+            smart_contract_files.append({
+                'name': file_path.name,
+                'path': str(relative_path),
+                'content': content,
+                'blob_url': blob_url,
+                'size': len(content),
+                'language': language,
+                'local_path': str(file_path),
+                'lines': len(content.splitlines()),
+                'is_valid': True
+            })
+            
+            if verbose:
+                print(f"Found {language} contract: {relative_path} ({len(content)} chars)")
         
         return smart_contract_files
     
