@@ -101,7 +101,7 @@ def fetch_file_content(owner: str, repo: str, path: str, ref: str, api_key: str)
                 print(f"File {path} not found in {owner}/{repo} at ref {ref}")
             elif e.response.status_code == 403 and 'rate limit' in e.response.text.lower():
                 print("API rate limit exceeded")
-                time.sleep(60)
+                time.sleep(300)
                 fetch_file_content(owner, repo, path, ref, api_key)
         return None
 

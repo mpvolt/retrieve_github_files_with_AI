@@ -41,7 +41,7 @@ def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
         
         if resp.status_code == 403:  # Rate limit
             print("Rate limit exceeded, waiting...")
-            time.sleep(60)
+            time.sleep(300)
             continue
         elif resp.status_code != 200:
             print(f"GitHub API error: {resp.status_code}")
@@ -193,11 +193,38 @@ def check_single_positive_match(matched_files):
 
 
 def assign_afflicted_blob_url(report, high_confidence_matches):
-    """Assign the afflicted_github_code_blob field if we have a high-confidence match."""
-    if high_confidence_matches:
-        report['afflicted_github_code_blob'] = high_confidence_matches[0]['blob_url']
-    else:
-        report['afflicted_github_code_blob'] = None
+    """
+    Assign afflicted_github_code_blob:
+    - Always consider the top match for score
+    - Include subsequent matches only if within 40 points of top total_score
+    - Always include any match scoring over 600
+    - Only include matches with a valid blob_url
+    """
+    report['afflicted_github_code_blob'] = []
+
+    if not high_confidence_matches:
+        return
+
+    # Sort descending by total_score
+    sorted_matches = sorted(high_confidence_matches, key=lambda m: m.get("total_score", 0), reverse=True)
+
+    top_score = sorted_matches[0].get("total_score", 0)
+
+    selected = []
+    for m in sorted_matches:
+        score = m.get("total_score", 0)
+        blob_url = m.get("blob_url")
+        if not blob_url:
+            continue
+
+        # Include if within 40 points of top OR score > 600
+        if top_score - score <= 40 or score > 600:
+            selected.append(blob_url)
+        else:
+            break  # stop as soon as difference > 40 and score <= 600
+
+    report['afflicted_github_code_blob'] = selected
+
 
 
 def create_summary_result(report_id, report_title, report, top_match, from_commit_history, single_file_match):
@@ -444,8 +471,6 @@ def analyze_relevant_files(json_file):
     
     # Check if we have minimal files to process
     is_minimal, total_files = check_minimal_files(relevant_files_dict)
-    if is_minimal:
-        return relevant_files_dict
     
     # Normalize reports data
     reports = normalize_reports_data(reports)
@@ -493,12 +518,7 @@ def analyze_relevant_files(json_file):
     return all_matches  # Returns ONLY high confidence matches (150+ score)
 
 def main():
-    json_file = "hacken/filtered_[SCA]Hyperlane_InterchainMessageService_Apr2023.json"
-    json_file = "hacken/filtered_[SCA]Hesty_Hesty-Contract_Oct2024.json"
-    json_file = "hacken/filtered_[SCA]GiveUs_Voting+DAO_May2023.json"
-    json_file = "hacken/filtered_[SCA]Zharta_P2PLending_Sept2024.json"
-    json_file = "hacken/filtered_[SCA]XPower_ERC20+ERC1155+Staking_Dec2023.json"
-    #json_file = "hacken/filtered_[SCA]WrappedMillix_Bridge+ERC20_Mar2023.json"
+    json_file = "hacken/filtered_[SCA]AirDAO_Bridge_Apr2024.json"
 
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"

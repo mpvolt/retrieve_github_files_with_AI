@@ -355,7 +355,7 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
 
 def main():
-    json_file = "hacken/filtered_[SCA]XPower_ERC20+ERC1155+Staking_Dec2023.json"
+    json_file = "hacken/filtered_[SCA]AirDAO_Bridge_Apr2024.json"
 
     # Load JSON file
     results = get_relevant_files(json_file)

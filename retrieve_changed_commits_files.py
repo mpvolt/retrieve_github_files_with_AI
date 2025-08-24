@@ -80,7 +80,7 @@ class GitHubAPIHandler:
         """
         if not self.check_rate_limit():
             print("Rate limit exceeded!")
-            time.sleep(60)
+            time.sleep(300)
             return self.get_commit_info(owner, repo, commit_hash)
             
         url = f"{self.base_url}/repos/{owner}/{repo}/commits/{commit_hash}"
@@ -126,19 +126,22 @@ class GitHubAPIHandler:
                     if file_info['status'] == 'renamed' and 'previous_filename' in file_info:
                         older_filename = file_info['previous_filename']
                     
-                    # Get blob SHAs from the API response
-                    current_blob_sha = file_info.get('sha', commit_hash)  # Use file's blob SHA if available
-                    
-                    # Construct current blob URL using the file's blob SHA
-                    current_blob_url = self.construct_blob_url(owner, repo, current_blob_sha, current_filename)
+                                        # Get blob SHAs from the API response
+                    current_blob_sha = file_info.get('sha')  # File's actual blob SHA
+
+                    # Construct current blob URL only if we have a valid blob SHA
+                    if file_info['status'] != 'removed':
+                        encoded_filename = self.safe_url_encode(current_filename)
+                        current_blob_url = f"https://github.com/{owner}/{repo}/blob/{commit_hash}/{encoded_filename}"
+                    else:
+                        current_blob_url = ''
+
                     older_blob_url = ''
-                    
-                    # For older blob URL, we need to get the file's blob SHA at parent commit
-                    # Only create older blob URL if file existed before (not for added files)
                     if file_info['status'] not in ['added']:
-                        # We'll need to fetch the file's blob SHA at the parent commit
-                        older_blob_url = self.get_file_blob_url_at_commit(owner, repo, parent_sha, older_filename)
-                    
+                        encoded_older_filename = self.safe_url_encode(older_filename)
+                        older_blob_url = f"https://github.com/{owner}/{repo}/blob/{parent_sha}/{encoded_older_filename}"
+
+
                     # Use API's raw_url if available, otherwise construct it
                     raw_url = file_info.get('raw_url', '')
                     if not raw_url and file_info['status'] != 'removed':
@@ -169,7 +172,7 @@ class GitHubAPIHandler:
                 return None
             elif response.status_code == 403 and 'rate limit' in response.text.lower():
                 print(f"Rate limit exceeded")
-                time.sleep(60)
+                time.sleep(300)
                 return self.get_commit_info(owner, repo, commit_hash)
             else:
                 print(f"✗ API request failed with status {response.status_code}: {response.text}")
@@ -200,7 +203,7 @@ class GitHubAPIHandler:
         """
         if not self.check_rate_limit():
             print("Rate limit exceeded")
-            time.sleep(60)
+            time.sleep(300)
             return self.get_file_content_at_commit(owner, repo, commit_hash, file_path)
             
         # Encode the file path properly for the API call

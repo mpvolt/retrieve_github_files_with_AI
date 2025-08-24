@@ -270,225 +270,467 @@ class GitCloneHandler:
             self.temp_dir = None
             self.repo_path = None
 
-class GitHubAPIHandler:
+class GitHubGraphQLHandler:
     def __init__(self):
         self.api_key = os.getenv('GITHUB_API_KEY')
-        self.base_url = "https://api.github.com"
+        self.graphql_url = "https://api.github.com/graphql"
         self.session = requests.Session()
         
         if self.api_key:
             self.session.headers.update({
-                'Authorization': f'token {self.api_key}',
-                'Accept': 'application/vnd.github.v3+json'
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json'
             })
-            print("✓ GitHub API key found and configured")
+            print("✓ GitHub API key found and configured for GraphQL")
         else:
-            print("⚠ No GitHub API key found. Rate limits will be much lower (60 req/hour vs 5000 req/hour)")
+            print("⚠ No GitHub API key found. GraphQL API requires authentication")
     
     def check_rate_limit(self):
-        """Check current API rate limit status"""
+        """Check current GraphQL rate limit status"""
+        query = """
+        query {
+            rateLimit {
+                limit
+                remaining
+                resetAt
+            }
+        }
+        """
+        
         try:
-            response = self.session.get(f"{self.base_url}/rate_limit")
+            response = self.session.post(self.graphql_url, json={'query': query})
             if response.status_code == 200:
                 data = response.json()
-                core_limit = data['resources']['core']
-                print(f"Rate limit: {core_limit['remaining']}/{core_limit['limit']} remaining")
-                if core_limit['remaining'] < 10:
-                    reset_time = core_limit['reset']
-                    print(f"⚠ Low rate limit! Resets at {time.ctime(reset_time)}")
-                return core_limit['remaining'] > 0
+                if 'data' in data and 'rateLimit' in data['data']:
+                    rate_limit = data['data']['rateLimit']
+                    print(f"GraphQL Rate limit: {rate_limit['remaining']}/{rate_limit['limit']} remaining")
+                    if rate_limit['remaining'] < 10:
+                        print(f"⚠ Low rate limit! Resets at {rate_limit['resetAt']}")
+                    return rate_limit['remaining'] > 0
         except Exception as e:
             print(f"Could not check rate limit: {e}")
         return True
     
     def get_pr_files(self, owner, repo, pr_number):
         """
-        Get list of changed files in a pull request via GitHub API, including proper blob SHAs
+        Get list of changed files in a pull request via GitHub GraphQL API
         """
+        if not self.api_key:
+            print("GraphQL API requires authentication. Please set GITHUB_API_KEY environment variable.")
+            return None
+            
         if not self.check_rate_limit():
             print("Rate limit exceeded!")
-            time.sleep(60)
-            self.get_pr_files(owner, repo, pr_number)
-            
-        # First, get PR details to extract base and head refs and SHAs
-        pr_url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_number}"
+            return None
+        
+        # GraphQL query to get PR details and files
+        query = """
+        query GetPullRequestFiles($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                    number
+                    baseRefName
+                    headRefName
+                    baseRefOid
+                    headRefOid
+                    mergeable
+                    merged
+                    state
+                    title
+                    body
+                    files(first: 100, after: $cursor) {
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
+                        edges {
+                            node {
+                                path
+                                additions
+                                deletions
+                                changeType
+                                patch
+                            }
+                        }
+                    }
+                    baseRepository {
+                        name
+                        owner {
+                            login
+                        }
+                    }
+                    headRepository {
+                        name
+                        owner {
+                            login
+                        }
+                    }
+                    commits(last: 1) {
+                        edges {
+                            node {
+                                commit {
+                                    oid
+                                    tree {
+                                        oid
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    baseRef {
+                        target {
+                            ... on Commit {
+                                oid
+                                tree {
+                                    oid
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "owner": owner,
+            "repo": repo,
+            "number": int(pr_number)
+        }
+        
         try:
-            #print(f"Fetching PR details: {pr_url}")
-            pr_response = self.session.get(pr_url)
+            print(f"🔄 Fetching PR #{pr_number} files via GraphQL...")
             
-            if pr_response.status_code != 200:
-                print(f"✗ Failed to fetch PR details with status {pr_response.status_code}: {pr_response.text}")
-                return None
+            # Get all files (handle pagination)
+            all_files = []
+            cursor = None
+            
+            while True:
+                if cursor:
+                    variables["cursor"] = cursor
                 
-            pr_data = pr_response.json()
-            base_ref = pr_data['base']['ref']
-            head_ref = pr_data['head']['ref']
-            base_sha = pr_data['base']['sha']
-            head_sha = pr_data['head']['sha']
+                response = self.session.post(
+                    self.graphql_url, 
+                    json={'query': query, 'variables': variables}
+                )
+                
+                if response.status_code != 200:
+                    print(f"✗ GraphQL request failed with status {response.status_code}: {response.text}")
+                    return None
+                
+                data = response.json()
+                
+                if 'errors' in data:
+                    print(f"✗ GraphQL errors: {data['errors']}")
+                    return None
+                
+                if not data.get('data', {}).get('repository', {}).get('pullRequest'):
+                    print(f"✗ Pull request #{pr_number} not found")
+                    return None
+                
+                pr_data = data['data']['repository']['pullRequest']
+                files_data = pr_data['files']
+                
+                # Add files from this page
+                all_files.extend([edge['node'] for edge in files_data['edges']])
+                
+                # Check if there are more pages
+                if files_data['pageInfo']['hasNextPage']:
+                    cursor = files_data['pageInfo']['endCursor']
+                else:
+                    break
             
-            # print(f"PR #{pr_number}: {head_ref} -> {base_ref}")
-            # print(f"Base branch: {base_ref} (SHA: {base_sha})")
-            # print(f"Head branch: {head_ref} (SHA: {head_sha})")
+            print(f"✓ Retrieved {len(all_files)} files from PR #{pr_number}")
             
-            # Construct tree URLs
+            # Extract PR information
+            base_ref = pr_data['baseRefName']
+            head_ref = pr_data['headRefName'] 
+            base_sha = pr_data['baseRefOid']
+            head_sha = pr_data['headRefOid']
+            
+            # Get tree SHAs
+            base_tree_sha = pr_data['baseRef']['target']['tree']['oid'] if pr_data['baseRef'] else None
+            head_tree_sha = pr_data['commits']['edges'][0]['node']['commit']['tree']['oid'] if pr_data['commits']['edges'] else None
+            
+            print(f"PR #{pr_number}: {head_ref} -> {base_ref}")
+            print(f"Base: {base_ref} (SHA: {base_sha})")
+            print(f"Head: {head_ref} (SHA: {head_sha})")
+            
+            # Find earliest commit for the changed files
+            earliest_origin = self.find_earliest_commit_for_files(owner, repo, all_files, base_sha)
+            
+            # Construct URLs
             base_tree_url = f"https://github.com/{owner}/{repo}/tree/{base_ref}"
             head_tree_url = f"https://github.com/{owner}/{repo}/tree/{head_ref}"
             
-            # Now get the changed files - this is where we get the actual blob SHAs
-            files_url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_number}/files"
-            # print(f"Fetching PR files: {files_url}")
-            files_response = self.session.get(files_url)
+            pr_info = {
+                'pr_number': int(pr_number),
+                'base_ref': base_ref,
+                'head_ref': head_ref,
+                'base_sha': base_sha,
+                'head_sha': head_sha,
+                'base_tree_sha': base_tree_sha,
+                'head_tree_sha': head_tree_sha,
+                'base_tree_url': base_tree_url,
+                'head_tree_url': head_tree_url,
+                'mergeable': pr_data.get('mergeable'),
+                'merged': pr_data.get('merged'),
+                'state': pr_data.get('state'),
+                'title': pr_data.get('title', ''),
+                'body': pr_data.get('body', ''),
+                'files': []
+            }
             
-            if files_response.status_code == 200:
-                files_data = files_response.json()
-                # print(f"✓ Successfully retrieved {len(files_data)} changed files for PR #{pr_number}")
+            # Add earliest origin information
+            if earliest_origin:
+                pr_info['original_tree_url'] = f"https://github.com/{owner}/{repo}/tree/{earliest_origin['sha']}"
+                pr_info['earliest_commit_info'] = earliest_origin
+            else:
+                pr_info['original_tree_url'] = base_tree_url
+                pr_info['earliest_commit_info'] = None
+            
+            # Process files
+            for file_data in all_files:
+                filename = file_data['path']
+                change_type = file_data.get('changeType', 'MODIFIED').lower()
                 
-                # Get tree information for both base and head commits
-                base_tree_info = self.get_commit_tree(owner, repo, base_sha)
-                head_tree_info = self.get_commit_tree(owner, repo, head_sha)
+                # Map GraphQL change types to standard status
+                change_type_map = {
+                    'added': 'added',
+                    'deleted': 'removed',
+                    'modified': 'modified',
+                    'renamed': 'renamed',
+                    'copied': 'copied'
+                }
+                status = change_type_map.get(change_type, 'modified')
                 
-                pr_info = {
-                    'pr_number': pr_number,
-                    'base_ref': base_ref,
-                    'head_ref': head_ref,
-                    'base_sha': base_sha,
-                    'head_sha': head_sha,
-                    'base_tree_url': base_tree_url,
-                    'head_tree_url': head_tree_url,
-                    'base_tree_info': base_tree_info,
-                    'head_tree_info': head_tree_info,
-                    'files': []
+                # Handle renamed files (GraphQL doesn't provide previous filename in this query)
+                previous_filename = filename
+                if status == 'renamed':
+                    # For renamed files, we might need additional logic to get the old filename
+                    # This would require parsing the patch or making additional queries
+                    previous_filename = self._extract_previous_filename_from_patch(file_data.get('patch', ''))
+                    if not previous_filename:
+                        previous_filename = filename
+                
+                # Construct URLs
+                old_blob_url = f"https://github.com/{owner}/{repo}/blob/{base_sha}/{quote(previous_filename)}" if status != 'added' else ''
+                new_blob_url = f"https://github.com/{owner}/{repo}/blob/{head_sha}/{quote(filename)}" if status != 'removed' else ''
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{head_sha}/{quote(filename)}" if status != 'removed' else ''
+                
+                file_info = {
+                    'filename': filename,
+                    'previous_filename': previous_filename,
+                    'status': status,
+                    'additions': file_data.get('additions', 0),
+                    'deletions': file_data.get('deletions', 0),
+                    'changes': (file_data.get('additions', 0) + file_data.get('deletions', 0)),
+                    'patch': file_data.get('patch', ''),
+                    
+                    # URLs
+                    'raw_url': raw_url,
+                    'old_blob_url': old_blob_url,
+                    'new_blob_url': new_blob_url,
+                    
+                    # Branch information
+                    'old_branch': base_ref if status != 'added' else '',
+                    'new_branch': head_ref if status != 'removed' else '',
+                    
+                    # Commit SHAs
+                    'base_commit_sha': base_sha,
+                    'head_commit_sha': head_sha,
+                    
+                    # API URLs for contents
+                    'contents_url_old': f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(previous_filename)}?ref={base_sha}" if status != 'added' else '',
+                    'contents_url_new': f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(filename)}?ref={head_sha}" if status != 'removed' else '',
+                    
+                    # Additional metadata
+                    'blob_sha': '',  # Would need additional GraphQL query to get blob SHA
+                    'score': 100
                 }
                 
-                # Process changed files first to collect them
-                changed_files_info = []
-                
-                # Process changed files first to collect them
-                changed_files_info = []
-                
-                # Process changed files
-                for file_info in files_data:
-                    filename = file_info['filename']
-                    status = file_info['status']
-                    
-                    # Extract blob URLs and SHAs from the API response
-                    # The API returns different information based on file status
-                    
-                    # For new files (head/current version)
-                    new_blob_url = file_info.get('blob_url', '')  # Points to new version
-                    new_raw_url = file_info.get('raw_url', '')    # Raw content URL
-                    
-                    # For old files, we need to construct the URL using the base commit
-                    # The 'blob_url' in the response points to the NEW version
-                    # We need to construct the old version URL ourselves
-                    if status == 'added':
-                        old_blob_url = ''
-                        old_blob_sha = ''
-                        old_branch = ''
-                    else:
-                        old_blob_url = f"https://github.com/{owner}/{repo}/blob/{base_sha}/{quote(filename)}"
-                        old_blob_sha = base_sha  # We'll get the specific blob SHA later if needed
-                        old_branch = base_ref
-                    
-                    if status == 'removed':
-                        new_blob_url = ''
-                        new_blob_sha = ''
-                        new_branch = ''
-                    else:
-                        new_blob_sha = head_sha  # We'll get the specific blob SHA later if needed
-                        new_branch = head_ref
-                    
-                    # Try to extract actual blob SHA from the blob_url if available
-                    # GitHub blob URLs sometimes contain the actual blob SHA
-                    actual_blob_sha = None
-                    if 'sha' in file_info:
-                        actual_blob_sha = file_info['sha']
-                    elif new_blob_url:
-                        # Try to extract from the blob URL structure
-                        # GitHub blob URLs can be: /blob/{ref}/{path} or sometimes include blob SHA
-                        pass
-                    
-                    # Check if there's a previous_filename for renamed files
-                    previous_filename = file_info.get('previous_filename', filename)
-                    if previous_filename != filename:
-                        # For renamed files, the old blob URL should use the old filename
-                        old_blob_url = f"https://github.com/{owner}/{repo}/blob/{base_sha}/{quote(previous_filename)}"
-
-                    file_data = {
-                        'filename': filename,
-                        'previous_filename': previous_filename,
-                        'status': status,
-                        'additions': file_info.get('additions', 0),
-                        'deletions': file_info.get('deletions', 0),
-                        'changes': file_info.get('changes', 0),
-                        'patch': file_info.get('patch', ''),
-                        
-                        # Raw content URLs
-                        'raw_url': new_raw_url,
-                        
-                        # API provided blob URL (points to new version)
-                        'api_blob_url': new_blob_url,
-                        
-                        # Constructed blob URLs for both versions
-                        'old_blob_url': old_blob_url,
-                        'new_blob_url': new_blob_url,
-                        
-                        # Branch information
-                        'old_branch': old_branch,
-                        'new_branch': new_branch,
-                        
-                        # Commit SHAs
-                        'base_commit_sha': base_sha,
-                        'head_commit_sha': head_sha,
-                        
-                        # Blob SHA if available
-                        'blob_sha': actual_blob_sha,
-                        
-                        # Contents URL for API access
-                        'contents_url_old': f"{self.base_url}/repos/{owner}/{repo}/contents/{quote(previous_filename)}?ref={base_sha}" if old_branch else '',
-                        'contents_url_new': f"{self.base_url}/repos/{owner}/{repo}/contents/{quote(filename)}?ref={head_sha}" if new_branch else ''
-                    }
-                    
-                    changed_files_info.append(file_data)
-                    pr_info['files'].append(file_data)
-                
-                # Now find the earliest commit that contains any of the changed files
-                earliest_origin = self.find_earliest_commit_for_files(owner, repo, changed_files_info, base_sha)
-                
-                if earliest_origin:
-                    # Get tree info for the earliest commit
-                    earliest_tree_info = self.get_commit_tree(owner, repo, earliest_origin['sha'])
-                    pr_info['earliest_tree_info'] = earliest_tree_info
-                    pr_info['earliest_commit_info'] = earliest_origin
-                    
-                    # Update the old tree URL to point to the earliest origin
-                    pr_info['original_tree_url'] = f"https://github.com/{owner}/{repo}/tree/{earliest_origin['sha']}"
-                else:
-                    # Fallback to base commit
-                    pr_info['earliest_tree_info'] = base_tree_info
-                    pr_info['earliest_commit_info'] = None
-                    pr_info['original_tree_url'] = base_tree_url
-                
-                return pr_info
-                
-            elif files_response.status_code == 404:
-                print(f"✗ Pull request #{pr_number} not found (404)")
-                return None
-            elif files_response.status_code == 403 and 'rate limit' in files_response.text.lower():
-                print(f"Rate limit exceeded")
-                time.sleep(60)
-                self.get_pr_files(owner, repo, pr_number)
-            else:
-                print(f"✗ API request failed with status {files_response.status_code}: {files_response.text}")
-                return None
-                
+                pr_info['files'].append(file_info)
+            
+            return pr_info
+            
         except Exception as e:
-            print(f"Error fetching PR files: {e}")
+            print(f"Error fetching PR files via GraphQL: {e}")
             return None
+    
+    def _extract_previous_filename_from_patch(self, patch):
+        """
+        Extract the previous filename from a git patch for renamed files
+        """
+        if not patch:
+            return None
+        
+        import re
+        
+        # Look for rename information in patch header
+        # Pattern: "rename from old_file" or "--- a/old_file"
+        rename_from_match = re.search(r'^rename from (.+)$', patch, re.MULTILINE)
+        if rename_from_match:
+            return rename_from_match.group(1)
+        
+        # Alternative pattern in diff header
+        old_file_match = re.search(r'^--- a/(.+)$', patch, re.MULTILINE)
+        if old_file_match:
+            return old_file_match.group(1)
+        
+        return None
+    
+    def get_file_content_with_graphql(self, owner, repo, file_path, ref):
+        """
+        Get file content using GraphQL
+        """
+        if not self.check_rate_limit():
+            return None
+        
+        query = """
+        query GetFileContent($owner: String!, $repo: String!, $expression: String!) {
+            repository(owner: $owner, name: $repo) {
+                object(expression: $expression) {
+                    ... on Blob {
+                        text
+                        isBinary
+                        byteSize
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "owner": owner,
+            "repo": repo,
+            "expression": f"{ref}:{file_path}"
+        }
+        
+        try:
+            response = self.session.post(
+                self.graphql_url,
+                json={'query': query, 'variables': variables}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if 'errors' in data:
+                    print(f"GraphQL errors: {data['errors']}")
+                    return None
+                
+                repo_data = data.get('data', {}).get('repository')
+                if not repo_data:
+                    return None
+                
+                file_object = repo_data.get('object')
+                if not file_object:
+                    return None
+                
+                if file_object.get('isBinary'):
+                    print(f"File {file_path} is binary, cannot retrieve text content")
+                    return None
+                
+                return file_object.get('text')
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error getting file content via GraphQL: {e}")
+            return None
+    
+    def find_earliest_commit_for_files(self, owner, repo, changed_files, base_sha):
+        """
+        Find the earliest commit that contains any of the changed files using GraphQL
+        """
+        if not changed_files:
+            return None
+        
+        # For GraphQL, we'll use a simpler approach and query the commit history
+        query = """
+        query GetCommitHistory($owner: String!, $repo: String!, $ref: String!, $path: String!, $first: Int!) {
+            repository(owner: $owner, name: $repo) {
+                object(expression: $ref) {
+                    ... on Commit {
+                        history(first: $first, path: $path) {
+                            edges {
+                                node {
+                                    oid
+                                    committedDate
+                                    message
+                                    author {
+                                        name
+                                        email
+                                        date
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        earliest_commit = None
+        earliest_date = None
+        
+        print("🔍 Tracing file origins via GraphQL...")
+        
+        for file_info in changed_files:
+            if isinstance(file_info, dict) and file_info.get('changeType') == 'ADDED':
+                continue  # Skip newly added files
+            
+            file_path = file_info.get('path') if isinstance(file_info, dict) else file_info.get('filename', file_info.get('previous_filename'))
+            if not file_path:
+                continue
+            
+            variables = {
+                "owner": owner,
+                "repo": repo,
+                "ref": base_sha,
+                "path": file_path,
+                "first": 100
+            }
+            
+            try:
+                response = self.session.post(
+                    self.graphql_url,
+                    json={'query': query, 'variables': variables}
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if 'errors' not in data and data.get('data', {}).get('repository', {}).get('object'):
+                        history = data['data']['repository']['object']['history']['edges']
+                        
+                        if history:
+                            # Get the earliest (last) commit in the history
+                            earliest_in_history = history[-1]['node']
+                            commit_date = earliest_in_history['committedDate']
+                            
+                            if earliest_date is None or commit_date < earliest_date:
+                                earliest_date = commit_date
+                                earliest_commit = earliest_in_history
+                                
+            except Exception as e:
+                print(f"Error getting history for {file_path}: {e}")
+                continue
+        
+        if earliest_commit:
+            print(f"📅 Earliest origin commit: {earliest_commit['oid'][:8]} ({earliest_date})")
+            return {
+                'commit': earliest_commit,
+                'date': earliest_date,
+                'sha': earliest_commit['oid']
+            }
+        
+        return None
     
     def get_file_content(self, raw_url):
         """
-        Get file content from GitHub's raw URL
+        Get file content from GitHub's raw URL (fallback method)
         """
         try:
             response = self.session.get(raw_url)
@@ -499,196 +741,6 @@ class GitHubAPIHandler:
                 return None
         except Exception as e:
             print(f"Error fetching file content: {e}")
-            return None
-    
-    def get_file_content_at_commit(self, owner, repo, commit_sha, file_path):
-        """
-        Get specific file content at a specific commit via GitHub API
-        """
-        if not self.check_rate_limit():
-            return None
-            
-        url = f"{self.base_url}/repos/{owner}/{repo}/contents/{file_path}"
-        
-        try:
-            response = self.session.get(url, params={'ref': commit_sha})
-            
-            if response.status_code == 200:
-                file_data = response.json()
-                
-                if file_data.get('encoding') == 'base64':
-                    import base64
-                    content = base64.b64decode(file_data['content']).decode('utf-8', errors='ignore')
-                    return content
-                else:
-                    print(f"Unexpected encoding: {file_data.get('encoding')}")
-                    return None
-            else:
-                print(f"Failed to get file content: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            print(f"Error getting file content: {e}")
-            return None
-
-    def get_commit_tree(self, owner, repo, commit_sha):
-        """
-        Get the Git tree for a specific commit
-        """
-        if not self.check_rate_limit():
-            return None
-            
-        # First get the commit to get the tree SHA
-        commit_url = f"{self.base_url}/repos/{owner}/{repo}/git/commits/{commit_sha}"
-        
-        try:
-            response = self.session.get(commit_url)
-            
-            if response.status_code == 200:
-                commit_data = response.json()
-                tree_sha = commit_data['tree']['sha']
-                tree_url = commit_data['tree']['url']
-                
-                return {
-                    'tree_sha': tree_sha,
-                    'tree_api_url': tree_url,
-                    'tree_github_url': f"https://github.com/{owner}/{repo}/tree/{commit_sha}",
-                    'tree_git_url': f"{self.base_url}/repos/{owner}/{repo}/git/trees/{tree_sha}",
-                    'commit_sha': commit_sha
-                }
-            else:
-                print(f"Failed to get commit tree: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            print(f"Error getting commit tree: {e}")
-            return None
-
-    def get_tree_contents(self, owner, repo, tree_sha, recursive=False):
-        """
-        Get the contents of a Git tree (optionally recursive)
-        """
-        if not self.check_rate_limit():
-            return None
-            
-        url = f"{self.base_url}/repos/{owner}/{repo}/git/trees/{tree_sha}"
-        params = {}
-        if recursive:
-            params['recursive'] = '1'
-        
-        try:
-            response = self.session.get(url, params=params)
-            
-            if response.status_code == 200:
-                tree_data = response.json()
-                return tree_data
-            else:
-                print(f"Failed to get tree contents: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            print(f"Error getting tree contents: {e}")
-            return None
-
-    def get_file_commit_history(self, owner, repo, file_path, until_sha=None):
-        """
-        Get commit history for a specific file, optionally until a specific commit
-        """
-        if not self.check_rate_limit():
-            return None
-            
-        url = f"{self.base_url}/repos/{owner}/{repo}/commits"
-        params = {
-            'path': file_path,
-            'per_page': 100  # Get more history
-        }
-        if until_sha:
-            params['sha'] = until_sha
-        
-        try:
-            response = self.session.get(url, params=params)
-            
-            if response.status_code == 200:
-                commits = response.json()
-                return commits
-            else:
-                print(f"Failed to get file history: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            print(f"Error getting file history: {e}")
-            return None
-
-    def find_earliest_commit_for_files(self, owner, repo, changed_files, base_sha):
-        """
-        Find the earliest commit that contains any of the changed files
-        """
-        earliest_commit = None
-        earliest_date = None
-        file_origins = {}
-        
-        #print("🔍 Tracing file origins...")
-        
-        for file_info in changed_files:
-            if file_info['status'] == 'added':
-                continue  # Skip newly added files
-                
-            file_path = file_info.get('previous_filename', file_info['filename'])
-            #print(f"  Tracing {file_path}...")
-            
-            # Get commit history for this file up to the base commit
-            history = self.get_file_commit_history(owner, repo, file_path, base_sha)
-            
-            if history and len(history) > 0:
-                # The last commit in the history is the earliest one
-                file_earliest = history[-1]
-                file_commit_date = file_earliest['commit']['committer']['date']
-                file_origins[file_path] = {
-                    'commit': file_earliest,
-                    'date': file_commit_date,
-                    'sha': file_earliest['sha']
-                }
-                
-                #print(f"    Earliest commit: {file_earliest['sha'][:8]} ({file_commit_date})")
-                
-                # Track the globally earliest commit
-                if earliest_date is None or file_commit_date < earliest_date:
-                    earliest_date = file_commit_date
-                    earliest_commit = file_earliest
-                    
-        if earliest_commit:
-            #print(f"📅 Earliest origin commit: {earliest_commit['sha'][:8]} ({earliest_date})")
-            return {
-                'commit': earliest_commit,
-                'date': earliest_date,
-                'sha': earliest_commit['sha'],
-                'file_origins': file_origins
-            }
-        else:
-            print("⚠️  Could not determine earliest commit, falling back to base commit")
-            return None
-
-    def get_blob_details(self, owner, repo, blob_sha):
-        """
-        Get blob details using the Git blobs API
-        """
-        if not self.check_rate_limit():
-            return None
-            
-        url = f"{self.base_url}/repos/{owner}/{repo}/git/blobs/{blob_sha}"
-        
-        try:
-            response = self.session.get(url)
-            
-            if response.status_code == 200:
-                blob_data = response.json()
-                return blob_data
-            else:
-                print(f"Failed to get blob details: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            print(f"Error getting blob details: {e}")
             return None
 
 def parse_github_url(url):
@@ -711,7 +763,7 @@ def parse_github_url(url):
 
 def handle_pr_files_via_git_clone(github_url, search_terms=None):
     """
-    Handle pull request files using git clone approach with fallback to API
+    Handle pull request files using git clone approach with fallback to GraphQL API
     """
     print("🚀 Attempting git clone approach...")
     
@@ -725,15 +777,15 @@ def handle_pr_files_via_git_clone(github_url, search_terms=None):
                 print("✅ Successfully processed PR using git clone method")
                 return result, git_handler
             else:
-                print("⚠️  Git clone succeeded but PR processing failed, falling back to API...")
+                print("⚠️  Git clone succeeded but PR processing failed, falling back to GraphQL API...")
         else:
-            print("⚠️  Git clone failed, falling back to API method...")
+            print("⚠️  Git clone failed, falling back to GraphQL API method...")
     except Exception as e:
         print(f"⚠️  Git clone method failed with error: {e}")
-        print("Falling back to API method...")
+        print("Falling back to GraphQL API method...")
     
-    # Fallback to API method
-    print("🔄 Using GitHub API fallback method...")
+    # Fallback to GraphQL API method
+    print("🔄 Using GitHub GraphQL API fallback method...")
     
     url_type, url_parts = parse_github_url(github_url)
     
@@ -749,7 +801,7 @@ def handle_pr_files_via_git_clone(github_url, search_terms=None):
     repo = url_parts['repo']
     pr_number = url_parts['pr']
     
-    api = GitHubAPIHandler()
+    api = GitHubGraphQLHandler()
     pr_info = api.get_pr_files(owner, repo, pr_number)
     
     if not pr_info:
@@ -801,14 +853,18 @@ def handle_pr_files_via_git_clone(github_url, search_terms=None):
         'base_tree_url': pr_info['base_tree_url'],
         'head_tree_url': pr_info['head_tree_url'],
         'original_tree_url': pr_info.get('original_tree_url'),
-        'base_tree_info': pr_info.get('base_tree_info'),
-        'head_tree_info': pr_info.get('head_tree_info'),
-        'earliest_tree_info': pr_info.get('earliest_tree_info'),
+        'base_tree_sha': pr_info.get('base_tree_sha'),
+        'head_tree_sha': pr_info.get('head_tree_sha'),
         'earliest_commit_info': pr_info.get('earliest_commit_info'),
+        'mergeable': pr_info.get('mergeable'),
+        'merged': pr_info.get('merged'),
+        'state': pr_info.get('state'),
+        'title': pr_info.get('title', ''),
+        'body': pr_info.get('body', ''),
         'files': matching_files
     }
     
-    print("✅ Successfully processed PR using GitHub API method")
+    print("✅ Successfully processed PR using GitHub GraphQL API method")
     return result, None
 
 def handle_pr_files_via_api(github_url, search_terms=None):

@@ -51,7 +51,7 @@ def search_github_for_code(code_snippet: str, repo_owner: str, repo_name: str, a
         # Handle rate limiting
         if response.status_code == 403 and 'rate limit' in response.text.lower():
             print(f"    GitHub search rate limited, waiting")
-            time.sleep(60)
+            time.sleep(200)
             search_github_for_code(code_snippet, repo_owner, repo_name, api_key)
         
         if response.status_code == 200:
@@ -124,10 +124,10 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
             if response.status_code == 403:
                 rate_limit_remaining = response.headers.get('X-RateLimit-Remaining', '0')
                 if rate_limit_remaining == '0':
-                    print(f"Rate limit exceeded. Waiting 60 seconds before retry (attempt {attempt + 1}/{max_retries})...")
+                    print(f"Rate limit exceeded. Waiting 5 min before retry (attempt {attempt + 1}/{max_retries})...")
                     if attempt < max_retries - 1:  # Don't wait on the last attempt
-                        time.sleep(60)
-                        continue  # Continue to next iteration instead of recursive call
+                        time.sleep(300)
+                        continue
             
             # If successful, break the retry loop
             if response.status_code == 200:
@@ -139,7 +139,8 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
         else:
             # This else clause executes if the loop completed without breaking
             # (meaning all retries failed due to rate limiting)
-            raise Exception("Failed to get content after maximum retries due to rate limiting")
+            print("Maximum retries attempted, retrying function")
+            return get_file_content_from_blob_url(blob_url, api_key)
         
         data = response.json()
         
@@ -147,6 +148,28 @@ def get_file_content_from_blob_url(blob_url: str, api_key: str) -> str:
         content = base64.b64decode(data['content']).decode('utf-8')
         return content
         
+    except requests.exceptions.HTTPError as e:
+        # Check if the exception was due to rate limiting
+        if hasattr(e, 'response') and e.response is not None:
+            if e.response.status_code == 403:
+                rate_limit_remaining = e.response.headers.get('X-RateLimit-Remaining', '0')
+                if rate_limit_remaining == '0':
+                    print(f"Rate limit hit in exception handler. Waiting 5 minutes before retrying entire function...")
+                    time.sleep(300)
+                    return get_file_content_from_blob_url(blob_url, api_key)
+        
+        print(f"HTTP Error fetching content from {blob_url}: {e}")
+        # Fallback to raw URL method (no rate limiting needed for raw URLs)
+        try:
+            raw_url = blob_url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+            response = requests.get(raw_url, timeout=30)
+            response.raise_for_status()
+            return response.text
+                
+        except Exception as e2:
+            print(f"Fallback method also failed: {e2}")
+            return ""
+            
     except Exception as e:
         print(f"Error fetching content from {blob_url}: {e}")
         # Fallback to raw URL method (no rate limiting needed for raw URLs)
@@ -295,6 +318,11 @@ def extract_variable_names_from_text(text: str) -> Set[str]:
     
     # Enhanced patterns for variable mentions
     patterns = [
+        # File path patterns (extension-agnostic) - added at the beginning for priority
+        r'@[\w-]+(?:/[\w-]+)*/(\w+)\.\w+',  # @org/repo/.../ClassName.ext
+        r'(?:^|[\s/])[\w-]+(?:/[\w-]+)*/(\w+)\.\w+',  # path/.../ClassName.ext
+        r'(?:^|[\s/])(\w+)\.\w+(?:\s|$)',  # ClassName.ext (standalone)
+        
         # Direct variable references with context
         r'the\s+(\w+)\s+(?:value|amount|variable|field)',  # the variableName value/amount/variable/field
         r'(\w+)\s+(?:is|are)\s+being',  # variableName is being

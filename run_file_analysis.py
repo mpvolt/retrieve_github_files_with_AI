@@ -153,7 +153,7 @@ def process_json_files_with_rate_limiting():
         rate_manager = GitHubRateLimitManager(api_key, min_requests_threshold=50)
         
         # Find all JSON files in subdirectories
-        json_files = find_json_files("hacken")
+        json_files = find_json_files(".")
         
         if not json_files:
             logger.info("No JSON files found in subdirectories")
@@ -273,11 +273,18 @@ def process_json_files_with_rate_limiting():
 
 def main():
     """Entry point for the script"""
+    start_time = time.time()
+    
     try:
         process_json_files_with_rate_limiting()
     except Exception as e:
         logger.error(f"Script failed: {e}")
         raise
-
+    finally:
+        end_time = time.time()
+        execution_time = end_time - start_time
+        logger.info(f"Script execution time: {execution_time:.2f} seconds")
+        print(f"Script completed in {execution_time:.2f} seconds")
+        
 if __name__ == "__main__":
     main()
