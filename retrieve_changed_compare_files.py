@@ -479,7 +479,7 @@ def handle_compare_files_via_api(github_url, search_terms=None):
     
     print("Changed files:")
     
-    smart_contract_extensions = ('.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
+    smart_contract_extensions = ('.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
     matching_files = []
     
     for file_info in compare_info['files']:

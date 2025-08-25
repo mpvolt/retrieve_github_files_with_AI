@@ -283,7 +283,7 @@ def handle_commit_files_via_api(github_url, search_terms=None):
     print(f"Older tree URL (parent, {commit_info['parent_sha']}): {commit_info['older_tree_url']}")
     print(f"Changed files:")
     
-    smart_contract_extensions = ('.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
+    smart_contract_extensions = ('.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom')
     matching_files = []
     
     for file_info in commit_info['files']:

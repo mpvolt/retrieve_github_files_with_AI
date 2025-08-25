@@ -9,12 +9,38 @@ from retrieve_all_smart_contract_functions import extract_function_names
 from match_files_to_report import match_bug_to_files
 import requests
 import time
+from urllib.parse import urlparse, unquote
 
 
 
 SMART_CONTRACT_EXTENSIONS = (
-        '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
+        '.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom'
     )
+
+def parse_github_url(github_url: str) -> Dict:
+    """Parse GitHub URL and extract components."""
+    url = github_url.rstrip('/').replace('.git', '')
+    parsed = urlparse(url)
+    path = parsed.path.lstrip('/')
+    
+    path_parts = path.split('/')
+    if len(path_parts) < 2:
+        raise ValueError(f"Invalid GitHub URL format: {github_url}")
+    
+    owner = path_parts[0]
+    repo = path_parts[1]
+    branch = 'main'  # Default
+    subpath = ''
+    
+    # Handle tree URLs
+    if len(path_parts) > 2 and path_parts[2] == 'tree':
+        if len(path_parts) > 3:
+            branch = unquote(path_parts[3])
+            if len(path_parts) > 4:
+                subpath = '/'.join(path_parts[4:])
+    
+    return owner, repo, branch, subpath
+
 
 def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
     """
@@ -134,7 +160,7 @@ def process_commit_history_matching(report, api_key):
     if not source_url:
         return None, None
     
-    print(f"  ⚠️ No relevant files found, walking commit history...")
+    print(f"  ⚠️ No relevant files found for {source_url}, walking commit history...")
     matched_files, fix_commit = find_files_up_commit_history(report, source_url, api_key)
     
     if matched_files and fix_commit:
@@ -518,8 +544,11 @@ def analyze_relevant_files(json_file):
     return all_matches  # Returns ONLY high confidence matches (150+ score)
 
 def main():
-    json_file = "hacken/filtered_[SCA]AirDAO_Bridge_Apr2024.json"
-
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    
+    # Use the CORRECT filename (note "copy.json" instead of ".json")
+    json_file = os.path.join(script_dir, "problems", "filtered_Myso Finance Lending Protocol_findings.json")
+    
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
     #json_file = "veridise/filtered_VAR-Untangled-250508-vaults-V2-findings.json"

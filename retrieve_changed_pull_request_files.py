@@ -135,7 +135,7 @@ class GitCloneHandler:
             
             # Parse diff output
             changed_files = []
-            smart_contract_extensions = ('.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
+            smart_contract_extensions = ('.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
             
             for line in diff_result.stdout.strip().split('\n'):
                 if not line:
@@ -845,7 +845,7 @@ def calculate_relevance_score(filename, patch_content, search_terms):
 
 def main():
     """Test the enhanced GitHub approach with git clone and API fallback"""
-    test_url = "https://github.com/Brahma-fi/protected_moonshots/pull/37"
+    test_url = "https://github.com/malda-protocol/malda-zk-coprocessor/pull/5"
     
     print("Testing enhanced GitHub approach (git clone + API fallback)...")
     print("=" * 70)

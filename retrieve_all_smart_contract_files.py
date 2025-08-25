@@ -35,6 +35,7 @@ from typing import List, Dict, Tuple, Optional, Set
 
 SMART_CONTRACT_EXTENSIONS = {
     '.sol': 'Solidity',
+    '.tsol': "Solidity (test)",
     '.vy': 'Vyper', 
     '.rs': 'Rust (Solana/NEAR)',
     '.cairo': 'Cairo (StarkNet)',
@@ -50,6 +51,7 @@ SMART_CONTRACT_EXTENSIONS = {
     '.aes': 'Sophia (Aeternity)',
     '.ride': 'Ride (Waves)',
     '.teal': 'TEAL (Algorand)',
+    '.circom': 'ZK Circuits'
 }
 
 class GitHubGraphQLRetriever:
@@ -66,6 +68,7 @@ class GitHubGraphQLRetriever:
             'User-Agent': 'SmartContract-GraphQL-Retriever/1.0'
         })
         self.graphql_url = "https://api.github.com/graphql"
+        self.max_graphql_depth = 8  # Configurable max depth for GraphQL queries
     
     def is_smart_contract_file(self, filename: str) -> Tuple[bool, str]:
         """Check if file is a smart contract based on extension."""
@@ -75,62 +78,72 @@ class GitHubGraphQLRetriever:
                 return True, language
         return False, ''
     
-    def build_tree_query(self, owner: str, repo: str, branch: str, path: str = "") -> str:
-        """Build GraphQL query to fetch entire repository tree in one request."""
-        tree_expression = f"{branch}:{path}" if path else f"{branch}:"
+    def build_tree_fragment(self, depth: int) -> str:
+        """Recursively build GraphQL tree fragment for specified depth."""
+        if depth <= 0:
+            return ""
         
-        return """
-        query GetRepositoryTree($owner: String!, $name: String!, $expression: String!) {
-          repository(owner: $owner, name: $name) {
-            object(expression: $expression) {
-              ... on Tree {
-                entries {
+        blob_fragment = """
+                        ... on Blob {
+                          byteSize
+                          text
+                          isBinary
+                        }"""
+        
+        if depth == 1:
+            return blob_fragment
+        
+        # Build the tree fragment recursively
+        nested_fragment = self.build_tree_fragment(depth - 1)
+        
+        tree_fragment = f"""
+                        ... on Tree {{
+                          entries {{
+                            name
+                            type
+                            path
+                            object {{
+                              {blob_fragment}
+                              {nested_fragment}
+                            }}
+                          }}
+                        }}"""
+        
+        return tree_fragment
+    
+    def build_tree_query(self, owner: str, repo: str, branch: str, path: str = "", max_depth: int = None) -> str:
+        """Build GraphQL query to fetch entire repository tree with configurable depth."""
+        if max_depth is None:
+            max_depth = self.max_graphql_depth
+        
+        tree_expression = f"{branch}:{path}" if path else f"{branch}:"
+        tree_fragment = self.build_tree_fragment(max_depth)
+        
+        return f"""
+        query GetRepositoryTree($owner: String!, $name: String!, $expression: String!) {{
+          repository(owner: $owner, name: $name) {{
+            object(expression: $expression) {{
+              ... on Tree {{
+                entries {{
                   name
                   type
                   path
-                  object {
-                    ... on Blob {
+                  object {{
+                    ... on Blob {{
                       byteSize
                       text
                       isBinary
-                    }
-                    ... on Tree {
-                      entries {
-                        name
-                        type
-                        path
-                        object {
-                          ... on Blob {
-                            byteSize
-                            text
-                            isBinary
-                          }
-                          ... on Tree {
-                            entries {
-                              name
-                              type
-                              path
-                              object {
-                                ... on Blob {
-                                  byteSize
-                                  text
-                                  isBinary
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            defaultBranchRef {
+                    }}
+                    {tree_fragment}
+                  }}
+                }}
+              }}
+            }}
+            defaultBranchRef {{
               name
-            }
-          }
-        }
+            }}
+          }}
+        }}
         """
     
     def execute_graphql_query(self, query: str, variables: Dict) -> Optional[Dict]:
@@ -178,7 +191,8 @@ class GitHubGraphQLRetriever:
         smart_contract_files = []
         
         for entry in tree_entries:
-            entry_path = f"{base_path}/{entry['name']}" if base_path else entry['name']
+            # Use GraphQL's path if available, otherwise construct it
+            entry_path = entry.get('path', f"{base_path}/{entry['name']}" if base_path else entry['name'])
             
             if entry['type'] == 'blob':
                 # Check if it's a smart contract file
@@ -214,17 +228,96 @@ class GitHubGraphQLRetriever:
         
         return smart_contract_files
     
-    def get_smart_contracts_batch(self, owner: str, repo: str, branch: str, 
-                                 path: str = "", verbose: bool = True) -> List[Dict]:
+    def get_directory_structure_paths(self, owner: str, repo: str, commit_sha: str) -> List[str]:
+        """Get all directory paths using REST API to determine max depth needed."""
+        tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{commit_sha}?recursive=1"
+        
+        try:
+            response = self.session.get(tree_url, timeout=30)
+            if response.status_code != 200:
+                return []
+            
+            tree_data = response.json()
+            if 'tree' not in tree_data:
+                return []
+            
+            # Get all directory paths
+            paths = []
+            for item in tree_data['tree']:
+                if item['type'] == 'blob':
+                    paths.append(item['path'])
+            
+            return paths
+            
+        except Exception:
+            return []
+    
+    def determine_max_depth(self, paths: List[str]) -> int:
+        """Determine maximum depth needed based on file paths."""
+        if not paths:
+            return self.max_graphql_depth
+        
+        max_depth = 0
+        for path in paths:
+            depth = len(path.split('/'))
+            max_depth = max(max_depth, depth)
+        
+        # Add buffer and cap at reasonable limit
+        return min(max_depth + 1, 12)
+    
+    def get_smart_contracts_adaptive_depth(self, owner: str, repo: str, branch: str, 
+                                         path: str = "", verbose: bool = True) -> List[Dict]:
         """
-        Get smart contracts using GraphQL batch approach - much more efficient!
-        This method can retrieve an entire repository structure in 1-2 API calls.
+        Get smart contracts using adaptive depth GraphQL - analyzes repository first.
+        This method determines the required depth and uses appropriate GraphQL query.
         """
         if verbose:
-            print(f"🚀 Using GraphQL (fast method)...")
+            print(f"Using adaptive-depth GraphQL...")
         
-        # Get the repository tree structure
-        tree_query = self.build_tree_query(owner, repo, branch, path)
+        # First, try to get commit SHA and analyze repository structure
+        commit_sha = None
+        try:
+            # Try to resolve branch/commit
+            if len(branch) == 40 and all(c in '0123456789abcdef' for c in branch.lower()):
+                commit_sha = branch
+            else:
+                # Get branch SHA
+                branch_url = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}"
+                response = self.session.get(branch_url, timeout=10)
+                if response.status_code == 200:
+                    commit_sha = response.json()['commit']['sha']
+            
+            if commit_sha and verbose:
+                print(f"   Analyzing repository structure for depth optimization...")
+                
+                # Get directory structure to determine optimal depth
+                paths = self.get_directory_structure_paths(owner, repo, commit_sha)
+                smart_contract_paths = []
+                
+                for file_path in paths:
+                    filename = file_path.split('/')[-1]
+                    is_contract, _ = self.is_smart_contract_file(filename)
+                    if is_contract:
+                        smart_contract_paths.append(file_path)
+                
+                if smart_contract_paths:
+                    optimal_depth = self.determine_max_depth(smart_contract_paths)
+                    if verbose:
+                        print(f"   Found {len(smart_contract_paths)} smart contracts, max depth needed: {optimal_depth}")
+                else:
+                    optimal_depth = self.max_graphql_depth
+                    if verbose:
+                        print(f"   No smart contracts found in initial scan, using default depth: {optimal_depth}")
+            else:
+                optimal_depth = self.max_graphql_depth
+                
+        except Exception as e:
+            if verbose:
+                print(f"   Structure analysis failed: {e}, using default depth")
+            optimal_depth = self.max_graphql_depth
+        
+        # Now execute GraphQL query with optimal depth
+        tree_query = self.build_tree_query(owner, repo, branch, path, optimal_depth)
         variables = {
             'owner': owner,
             'name': repo,
@@ -250,155 +343,53 @@ class GitHubGraphQLRetriever:
             print(f"GraphQL found {len(smart_contract_files)} smart contract files")
         
         return smart_contract_files
-
-class GitHubRestFallback:
-    """REST API fallback for when GraphQL doesn't work."""
     
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        self.session = requests.Session()
-        headers = {'User-Agent': 'SmartContract-REST-Fallback/1.0'}
-        if api_key:
-            headers['Authorization'] = f'token {api_key}'
-        self.session.headers.update(headers)
-        self.base_url = "https://api.github.com"
-    
-    def is_smart_contract_file(self, filename: str) -> Tuple[bool, str]:
-        """Check if file is a smart contract based on extension."""
-        filename_lower = filename.lower()
-        for ext, language in SMART_CONTRACT_EXTENSIONS.items():
-            if filename_lower.endswith(ext.lower()):
-                return True, language
-        return False, ''
-    
-    def get_commit_sha(self, owner: str, repo: str, branch_or_commit: str) -> Optional[str]:
-        """Get the actual SHA for a branch or validate a commit hash."""
-        
-        # If it already looks like a SHA, validate it exists
-        if (len(branch_or_commit) == 40 and 
-            all(c in '0123456789abcdef' for c in branch_or_commit.lower())):
-            commit_url = f"{self.base_url}/repos/{owner}/{repo}/commits/{branch_or_commit}"
-            try:
-                response = self.session.get(commit_url, timeout=10)
-                if response.status_code == 200:
-                    return response.json()['sha']
-            except:
-                pass
-            return None
-        
-        # Try to get branch info
-        branch_url = f"{self.base_url}/repos/{owner}/{repo}/branches/{branch_or_commit}"
-        try:
-            response = self.session.get(branch_url, timeout=10)
-            if response.status_code == 200:
-                return response.json()['commit']['sha']
-        except:
-            pass
-        
-        # Try as a tag
-        tag_url = f"{self.base_url}/repos/{owner}/{repo}/git/refs/tags/{branch_or_commit}"
-        try:
-            response = self.session.get(tag_url, timeout=10)
-            if response.status_code == 200:
-                return response.json()['object']['sha']
-        except:
-            pass
-        
-        return None
-    
-    def get_smart_contracts_rest(self, owner: str, repo: str, commit_sha: str, 
-                               subpath: str = "", verbose: bool = True) -> List[Dict]:
-        """Get smart contracts using REST API tree traversal."""
-        
+    def get_smart_contracts_batch(self, owner: str, repo: str, branch: str, 
+                                 path: str = "", verbose: bool = True) -> List[Dict]:
+        """
+        Get smart contracts using GraphQL batch approach - now with unlimited depth support!
+        This method can retrieve an entire repository structure regardless of depth.
+        """
         if verbose:
-            print(f"🔄 Using REST API fallback...")
-        
-        # Get the tree recursively
-        tree_url = f"{self.base_url}/repos/{owner}/{repo}/git/trees/{commit_sha}?recursive=1"
+            print(f"Using GraphQL (unlimited depth method)...")
         
         try:
-            response = self.session.get(tree_url, timeout=30)
-            
-            if response.status_code != 200:
-                if verbose:
-                    print(f"Failed to fetch tree: HTTP {response.status_code}")
-                return []
-            
-            tree_data = response.json()
-            
-            if 'tree' not in tree_data:
-                if verbose:
-                    print("No tree data in response")
-                return []
-            
-            # Find smart contract files
-            smart_contract_files = []
-            contract_items = []
-            
-            for item in tree_data['tree']:
-                if item['type'] == 'blob':
-                    # Check if path matches subpath filter
-                    if subpath and not item['path'].startswith(subpath):
-                        continue
-                    
-                    filename = item['path'].split('/')[-1]
-                    is_contract, language = self.is_smart_contract_file(filename)
-                    
-                    if is_contract:
-                        contract_items.append({
-                            'path': item['path'],
-                            'sha': item['sha'],
-                            'filename': filename,
-                            'language': language,
-                            'size': item.get('size', 0)
-                        })
-            
-            if verbose:
-                print(f"REST found {len(contract_items)} smart contract files")
-            
-            # Fetch file contents
-            for i, item in enumerate(contract_items):
-                if verbose and (i + 1) % 5 == 0:
-                    print(f"   Fetching {i + 1}/{len(contract_items)}: {item['filename']}")
-                
-                # Get file content
-                blob_url = f"{self.base_url}/repos/{owner}/{repo}/git/blobs/{item['sha']}"
-                blob_response = self.session.get(blob_url, timeout=15)
-                
-                if blob_response.status_code == 200:
-                    blob_data = blob_response.json()
-                    
-                    if 'content' in blob_data and blob_data.get('encoding') == 'base64':
-                        try:
-                            # Decode base64 content
-                            content = base64.b64decode(blob_data['content']).decode('utf-8', errors='ignore')
-                            
-                            # Skip empty files
-                            if content and len(content.strip()) > 10:
-                                smart_contract_files.append({
-                                    'name': item['filename'],
-                                    'path': item['path'],
-                                    'content': content,
-                                    'size': len(content),
-                                    'language': item['language'],
-                                    'lines': len(content.splitlines()),
-                                    'is_valid': True,
-                                    'sha': item['sha']
-                                })
-                        except Exception as e:
-                            if verbose:
-                                print(f"   Error decoding {item['filename']}: {e}")
-                
-                # Basic rate limiting
-                if (i + 1) % 10 == 0:
-                    time.sleep(1)
-            
-            return smart_contract_files
+            # Use adaptive depth approach
+            return self.get_smart_contracts_adaptive_depth(owner, repo, branch, path, verbose)
             
         except Exception as e:
             if verbose:
-                print(f"REST API error: {e}")
-            return []
+                print(f"Adaptive depth failed: {e}")
+            
+            # Fallback to fixed depth approach
+            if verbose:
+                print(f"   Falling back to fixed depth ({self.max_graphql_depth} levels)...")
+            
+            tree_query = self.build_tree_query(owner, repo, branch, path)
+            variables = {
+                'owner': owner,
+                'name': repo,
+                'expression': f"{branch}:{path}" if path else f"{branch}:"
+            }
+            
+            result = self.execute_graphql_query(tree_query, variables)
+            if not result or not result.get('repository', {}).get('object'):
+                if verbose:
+                    print("GraphQL fallback also failed")
+                raise Exception("GraphQL query failed")
+            
+            tree_object = result['repository']['object']
+            if not tree_object.get('entries'):
+                if verbose:
+                    print("No entries found in the specified path")
+                return []
+            
+            smart_contract_files = self.extract_files_from_tree(tree_object['entries'])
+            
+            if verbose:
+                print(f"GraphQL fallback found {len(smart_contract_files)} smart contract files")
+            
+            return smart_contract_files
 
 def parse_github_url(github_url: str) -> Dict:
     """Parse GitHub URL and extract components."""
@@ -665,7 +656,7 @@ if __name__ == "__main__":
         print("   You can create one at: https://github.com/settings/tokens")
     
     # Test with your specific URL
-    test_url = "https://github.com/ascendia-network/ambrosus-bridge/tree/c2ff4a510b5fbe52dc432421d83ed0e2363f7d80"
+    test_url = "https://github.com/mysofinance/v2/tree/c740f7c6b5ebd365618fd2d7ea77370599e1ca11"
     
     print(f"🧪 Testing GraphQL-first strategy:")
     print(f"URL: {test_url}")

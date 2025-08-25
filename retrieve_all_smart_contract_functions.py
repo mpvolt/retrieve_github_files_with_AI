@@ -22,7 +22,7 @@ from pathlib import Path  # Added missing import
 import time
 
 # Supported smart contract file extensions
-SMART_CONTRACT_EXTENSIONS = ('.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
+SMART_CONTRACT_EXTENSIONS = ('.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
 
 def parse_github_blob_url(blob_url: str) -> Optional[dict]:
     """
@@ -198,7 +198,7 @@ def extract_function_names(blob_url: str, api_key: Optional[str] = None) -> List
 
 
 if __name__ == "__main__":
-    blob_url = "https://github.com/PotLock/grantpicks/blob/69f785ed988d4aeefc4a041047bb5e4d200c6967/stellar/contract/lists/src/internal.rs"
+    blob_url = "https://github.com/mysofinance/v2/tree/37cf23668be352a4eac5d1cbed262f116e54d94f"
     API_KEY = os.getenv('GITHUB_API_KEY')
 
     functions = extract_function_names(blob_url, API_KEY)

@@ -9,7 +9,7 @@ from fuzzywuzzy import fuzz
 from urllib.parse import quote
 
 SMART_CONTRACT_EXTENSIONS = (
-    '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
+    '.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom'
 )
 
 def search_github_for_code(code_snippet: str, repo_owner: str, repo_name: str, api_key: str) -> List[str]:
@@ -576,7 +576,7 @@ def filter_relevant_files(file_urls: Set[str], bug_report: Dict) -> Set[str]:
     # Filter out test files and error files
     non_test_files = {
         file_url for file_url in file_urls 
-        if not any(keyword in file_url.lower() for keyword in ['test', 'spec', 'mock', 'errors'])
+        if not any(keyword in file_url.lower() for keyword in ['test', 'spec', 'mock', 'errors', 'interface'])
     }
     
     # Filter by smart contract extensions
@@ -633,7 +633,7 @@ def calculate_filename_mention_score(bug_report: Dict, file_path: str) -> tuple[
     
     if exact_mentions_count > 0:
         # Base score for first mention
-        base_score = 200.0
+        base_score = 350.0
         # Progressive bonus for additional mentions (diminishing returns)
         bonus_score = 0
         if exact_mentions_count > 1:
@@ -674,11 +674,6 @@ def calculate_filename_mention_score(bug_report: Dict, file_path: str) -> tuple[
             max_score = max(max_score, total_stem_score)
             match_reasons.append(f"Filename stem mentioned {stem_mentions_count} times: {filename_stem} (score: {total_stem_score:.1f})")
             print(f"      ✓ Filename stem found {stem_mentions_count} times: {filename_stem} (score: {total_stem_score:.1f})")
-    
-    # Smart contract extensions
-    SMART_CONTRACT_EXTENSIONS = (
-        '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
-    )
     
     # Check for additional filename patterns only if no strong match found yet
     if max_score < 180.0:
@@ -1102,63 +1097,86 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
         match_reasons = []
         score_breakdown = {}
         
-        # 1. GitHub Search Boost (HIGHEST PRIORITY)
+        # 1. GitHub Search Boost (HIGHEST PRIORITY - but reduced to make room for code similarity)
         if file_path in github_search_matches:
-            github_boost_score = 200.0  # Huge boost!
+            github_boost_score = 150.0  # Reduced from 200.0
             total_score += github_boost_score
             match_reasons.append("GitHub search found exact code snippet match")
             score_breakdown['github_search_boost'] = github_boost_score
             print(f"    🚀 GitHub Search Boost: {github_boost_score:.1f} (EXACT CODE MATCH!)")
         
-        # 2. Filename mention check (HIGH PRIORITY)
-        filename_score, filename_reasons = calculate_filename_mention_score(bug_report, file_path)
-        if filename_score > 0:
-            total_score += filename_score
-            match_reasons.extend(filename_reasons)
-            score_breakdown['filename_mention'] = filename_score
-            print(f"    Filename mention score: {filename_score:.1f}")
-        
-        # 3. Language match
-        # lang_score, lang_reasons = calculate_language_match_score(bug_report, file_path)
-        # if lang_score > 0:
-        #     total_score += lang_score
-        #     match_reasons.extend(lang_reasons)
-        #     score_breakdown['language'] = lang_score
-        
-        # 4. Code snippet similarity
+        # 2. Code snippet similarity (NOW VERY HIGH PRIORITY)
         if code_snippets:
             max_code_score = 0.0
             best_snippet_idx = -1
+            best_similarity_percentage = 0.0
+            
             for i, snippet in enumerate(code_snippets):
                 similarity = calculate_code_similarity(snippet, file_content)
                 print(f"    Snippet {i+1} similarity: {similarity:.1f}%")
                 if similarity > max_code_score:
                     max_code_score = similarity
                     best_snippet_idx = i
+                    best_similarity_percentage = similarity
             
-            if max_code_score > 30:  # Only count if reasonably similar
-                # Weight code similarity heavily as it's the most reliable indicator
-                weighted_score = max_code_score * 2.0  # Double weight for code similarity
+            # Enhanced scoring system for code similarity
+            if max_code_score > 10:  # Lower threshold to capture more matches
+                # Tiered scoring system based on similarity percentage
+                if best_similarity_percentage >= 80:
+                    # Extremely high similarity - nearly identical code
+                    weighted_score = max_code_score * 6.0  # 5x multiplier
+                    match_reasons.append(f"EXCELLENT code similarity (snippet {best_snippet_idx + 1}): {max_code_score:.1f}% - Nearly identical!")
+                elif best_similarity_percentage >= 60:
+                    # Very high similarity - substantial match
+                    weighted_score = max_code_score * 5.0  # 4x multiplier
+                    match_reasons.append(f"VERY HIGH code similarity (snippet {best_snippet_idx + 1}): {max_code_score:.1f}% - Strong match!")
+                elif best_similarity_percentage >= 40:
+                    # High similarity - good match
+                    weighted_score = max_code_score * 3.5  # 3.5x multiplier
+                    match_reasons.append(f"HIGH code similarity (snippet {best_snippet_idx + 1}): {max_code_score:.1f}% - Good match!")
+                elif best_similarity_percentage >= 25:
+                    # Moderate similarity - decent match
+                    weighted_score = max_code_score * 3.0  # 3x multiplier
+                    match_reasons.append(f"MODERATE code similarity (snippet {best_snippet_idx + 1}): {max_code_score:.1f}% - Decent match!")
+                else:
+                    # Low but relevant similarity
+                    weighted_score = max_code_score * 2.0  # 2x multiplier (original weight)
+                    match_reasons.append(f"Code similarity (snippet {best_snippet_idx + 1}): {max_code_score:.1f}%")
+                
                 total_score += weighted_score
-                match_reasons.append(f"Best code similarity (snippet {best_snippet_idx + 1}): {max_code_score:.1f}%")
                 score_breakdown['code_similarity'] = weighted_score
+                print(f"    🎯 Code Similarity Score: {weighted_score:.1f} (similarity: {best_similarity_percentage:.1f}%)")
         
-        # 5. Function name matches
+        # 3. Filename mention check (MEDIUM PRIORITY - reduced weight)
+        filename_score, filename_reasons = calculate_filename_mention_score(bug_report, file_path)
+        if filename_score > 0:
+            # Reduce filename score to not overshadow code similarity
+            adjusted_filename_score = filename_score * 0.7  # Reduce by 30%
+            total_score += adjusted_filename_score
+            match_reasons.extend([f"(filename) {reason}" for reason in filename_reasons])
+            score_breakdown['filename_mention'] = adjusted_filename_score
+            print(f"    Filename mention score: {adjusted_filename_score:.1f}")
+        
+        # 4. Function name matches (LOWER PRIORITY)
         func_score, func_reasons = calculate_function_match_score(bug_report, file_content)
         if func_score > 0:
-            total_score += func_score
-            match_reasons.extend(func_reasons)
-            score_breakdown['functions'] = func_score
+            # Reduce function score weight
+            adjusted_func_score = func_score * 0.6  # Reduce by 40%
+            total_score += adjusted_func_score
+            match_reasons.extend([f"(function) {reason}" for reason in func_reasons])
+            score_breakdown['functions'] = adjusted_func_score
         
-        # 6. Variable name matches
+        # 5. Variable name matches (LOWER PRIORITY)
         var_score, var_reasons = calculate_variable_match_score(bug_report, file_content)
         if var_score > 0:
-            total_score += var_score
-            match_reasons.extend(var_reasons)
-            score_breakdown['variables'] = var_score
+            # Reduce variable score weight
+            adjusted_var_score = var_score * 0.5  # Reduce by 50%
+            total_score += adjusted_var_score
+            match_reasons.extend([f"(variable) {reason}" for reason in var_reasons])
+            score_breakdown['variables'] = adjusted_var_score
         
-        print(f"    Total Score: {total_score:.1f}")
-        print(f"    Score Breakdown: {score_breakdown}")
+        print(f"    💯 TOTAL SCORE: {total_score:.1f}")
+        print(f"    📊 Score Breakdown: {score_breakdown}")
         
         if total_score > 0:
             matched_files.append({
@@ -1169,7 +1187,8 @@ def match_bug_to_files(bug_report: Dict, github_blob_urls: Set[str], api_key: st
                 'match_reasons': match_reasons,
                 'score_breakdown': score_breakdown,
                 'bug_id': bug_report.get('id', 'unknown'),
-                'github_search_match': file_path in github_search_matches
+                'github_search_match': file_path in github_search_matches,
+                'best_code_similarity': best_similarity_percentage if code_snippets else 0.0
             })
     
     # Sort by score (highest first) and return top results

@@ -17,7 +17,7 @@ from retrieve_all_smart_contract_functions import extract_function_names
 
 
 SMART_CONTRACT_EXTENSIONS = (
-        '.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func'
+        '.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom'
     )
 API_KEY = os.getenv('GITHUB_API_KEY')
 
@@ -220,12 +220,10 @@ def process_fix_urls(fix_urls: List[str]) -> Set[str]:
                 relevant_files_set.add(file_info['older_file_url'])
         elif 'tree' in url:
             print("Processing tree url, relevant smart contract files")
-            result = retrieve_all_smart_contract_files(url)
-            if hasattr(result, 'files') or isinstance(result, dict) and 'files' in result:
-                files = result['files'] if isinstance(result, dict) else result.files
-                for file in files:
-                    if 'blob_url' in file:
-                        relevant_files_set.add(file['blob_url'])
+            url = url.replace("/tree/", "/commit/")
+            result = handle_commit_files_via_api(url)
+            for file_info in result['files']:
+                relevant_files_set.add(file_info['older_file_url'])
         elif 'blob' in url:
             print("Blob detected, doing nothing")
             relevant_files_set.add(url)
@@ -264,6 +262,8 @@ def process_single_report(report: Dict[str, Any], report_index: int, processed_u
     
     # Validate URLs
     source_urls, fix_urls = validate_report_urls(report)
+    print(f"Source Urls: {source_urls}")
+    print(f"Fix Urls: {fix_urls}")
     
     if not source_urls and not fix_urls:
         print("Error: JSON must contain either 'source_code_url' or 'fix_commit_url'.")
@@ -273,9 +273,16 @@ def process_single_report(report: Dict[str, Any], report_index: int, processed_u
     search_json_str = extract_search_data(report)
     
     relevant_files_set = set()
+
+    # If the source url is already a blob (Example: Omniscia)
+    if fix_urls and source_urls:
+        for source_url in source_urls:
+            if 'github.com' in source_url and '/blob/' in source_url:
+                print(f"Using GitHub blob as relevant file: {source_url}")
+                relevant_files_set.update([source_url])
     
     # Process fix URLs first (preferred if available)
-    if fix_urls:
+    if not relevant_files_set and fix_urls:
         for fix_url in fix_urls:
             if fix_url in processed_urls:
                 print(f"Using cached results for fix URL: {fix_url}")
@@ -297,6 +304,7 @@ def process_single_report(report: Dict[str, Any], report_index: int, processed_u
                     new_files = process_source_urls([source_url])
                     processed_urls[source_url] = list(new_files)
                     relevant_files_set.update(new_files)
+            
     else:
         # Process source URLs if no fix URLs
         for source_url in source_urls:
@@ -355,7 +363,8 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
 
 def main():
-    json_file = "hacken/filtered_[SCA]AirDAO_Bridge_Apr2024.json"
+    json_file = "problems/filtered_Myso Finance Lending Protocol_findings.json"
+
 
     # Load JSON file
     results = get_relevant_files(json_file)
