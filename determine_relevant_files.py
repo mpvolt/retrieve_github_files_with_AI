@@ -152,7 +152,7 @@ def process_source_urls(source_urls: List[str]) -> Set[str]:
         source_urls: List of source code URLs to process
         
     Returns:
-        Set of relevant file URLs
+        All smart contract files in the source repo
     """
     relevant_files_set = set()
     
@@ -164,17 +164,21 @@ def process_source_urls(source_urls: List[str]) -> Set[str]:
             print("Processing commit url, retrieving new tree and relevant smart contract files")
             result = handle_commit_files_via_api(url)
             new_tree = result['newer_tree_url']
+
         elif 'pull' in url:
             print("Processing pull url, retrieving new tree and relevant smart contract files")
             result = handle_pr_files_via_api(url)
             new_tree = result['head_tree_info']
+
         elif 'compare' in url:
             print("Processing compare url, retrieving new tree and relevant smart contract files")
             result = handle_compare_files_via_api(url)
             new_tree = result['head_tree_url']
+
         elif 'tree' in url:
             print("Already a tree, retrieving smart contract files")
             new_tree = url
+
         elif 'blob' in url:
             print("Blob detected, doing nothing")
             relevant_files_set.add(url)
@@ -188,17 +192,20 @@ def process_source_urls(source_urls: List[str]) -> Set[str]:
     return relevant_files_set
 
 
-def process_fix_urls(fix_urls: List[str]) -> Set[str]:
+def process_fix_urls(fix_urls: List[str], changed_files_only: bool) -> Set[str]:
     """
     Process fix commit URLs to extract changed file URLs.
     
     Args:
         fix_urls: List of fix commit URLs to process
+        changed_files_only: If we want only the changed files in this pull/commit or all Smart Contract files
         
     Returns:
-        Set of relevant file URLs
+        Set of files that changed in this commit/pull (process first)
+        All smart contract files (second pass if first returns nothing)
     """
     relevant_files_set = set()
+    github_tree_url = ""
     
     for url in fix_urls:
         print(f"\nSearching fix commit at: {url}")
@@ -208,28 +215,41 @@ def process_fix_urls(fix_urls: List[str]) -> Set[str]:
             result = handle_commit_files_via_api(url)
             for file_info in result['files']:
                 relevant_files_set.add(file_info['older_file_url'])
+            github_tree_url = result['older_tree_url']
+
         elif 'pull' in url:
             print("Processing pull url, retrieving changed files")
             result = handle_pr_files_via_api(url)
             for file_info in result['files']:
                 relevant_files_set.add(file_info['old_blob_url'])
+            github_tree_url = result['base_branch']
+
         elif 'compare' in url:
             print("Processing compare url, retrieving changed files")
             result = handle_compare_files_via_api(url)
             for file_info in result['files']:
                 relevant_files_set.add(file_info['older_file_url'])
+            github_tree_url = result['base_tree_url']
+            
         elif 'tree' in url:
             print("Processing tree url, relevant smart contract files")
             url = url.replace("/tree/", "/commit/")
             result = handle_commit_files_via_api(url)
             for file_info in result['files']:
                 relevant_files_set.add(file_info['older_file_url'])
-        elif 'blob' in url:
-            print("Blob detected, doing nothing")
-            relevant_files_set.add(url)
+            github_tree_url = result['older_tree_url']
     
-    return relevant_files_set
+    all_files = set()
 
+    if github_tree_url and not changed_files_only:
+        # Get all smart contract files and check semantics
+        results = get_smart_contracts(github_url=github_tree_url, api_key=API_KEY)
+        for file in results['files']:
+            all_files.add(file['blob_url'])
+        return all_files
+
+    else:
+        return relevant_files_set        
 
 def filter_test_files(file_urls: Set[str]) -> List[str]:
     """
@@ -274,14 +294,14 @@ def process_single_report(report: Dict[str, Any], report_index: int, processed_u
     
     relevant_files_set = set()
 
-    # If the source url is already a blob (Example: Omniscia)
-    if fix_urls and source_urls:
+    # If the source url exists and is already a blob, no processing needed
+    if source_urls:
         for source_url in source_urls:
             if 'github.com' in source_url and '/blob/' in source_url:
                 print(f"Using GitHub blob as relevant file: {source_url}")
                 relevant_files_set.update([source_url])
     
-    # Process fix URLs first (preferred if available)
+    #Otherwise process fix URLs and see which files changed + other smart contract files
     if not relevant_files_set and fix_urls:
         for fix_url in fix_urls:
             if fix_url in processed_urls:
@@ -289,23 +309,12 @@ def process_single_report(report: Dict[str, Any], report_index: int, processed_u
                 relevant_files_set.update(processed_urls[fix_url])
             else:
                 print(f"Processing fix URL: {fix_url}")
-                new_files = process_fix_urls([fix_url])
-                processed_urls[fix_url] = list(new_files)
-                relevant_files_set.update(new_files)
-        
-        # Fallback to source URLs if no files found from fix URLs
-        if not relevant_files_set and source_urls:
-            for source_url in source_urls:
-                if source_url in processed_urls:
-                    print(f"Using cached results for source URL: {source_url}")
-                    relevant_files_set.update(processed_urls[source_url])
-                else:
-                    print(f"Processing source URL: {source_url}")
-                    new_files = process_source_urls([source_url])
-                    processed_urls[source_url] = list(new_files)
-                    relevant_files_set.update(new_files)
-            
-    else:
+                changed_files = process_fix_urls([fix_url], True)
+                processed_urls[fix_url] = list(changed_files)
+                relevant_files_set.update(changed_files)
+
+    #If no fix url, use source url if it exists
+    if not relevant_files_set and source_urls:
         # Process source URLs if no fix URLs
         for source_url in source_urls:
             if source_url in processed_urls:
@@ -317,7 +326,7 @@ def process_single_report(report: Dict[str, Any], report_index: int, processed_u
                 processed_urls[source_url] = list(new_files)
                 relevant_files_set.update(new_files)
     
-    # Filter out test files and convert to list
+    # Filter out test (.t.) files and convert to list
     relevant_files = filter_test_files(relevant_files_set)
     
     # Print results
@@ -363,7 +372,7 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
 
 def main():
-    json_file = "problems/filtered_Myso Finance Lending Protocol_findings.json"
+    json_file = "test/0xGuard/filtered_Boltr-Farm_final-audit-report_polygon.json"
 
 
     # Load JSON file
