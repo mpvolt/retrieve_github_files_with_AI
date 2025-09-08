@@ -4,14 +4,17 @@ import os
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 from fuzzywuzzy import fuzz
-from determine_relevant_files import get_relevant_files 
-from retrieve_all_smart_contract_functions import extract_function_names
-from match_files_to_report import match_bug_to_files
+from github_analysis_scripts.determine_relevant_files import get_relevant_files, process_fix_url
+from github_file_retrieval_scripts.retrieve_all_smart_contract_functions import extract_function_names
+from github_analysis_scripts.match_files_to_report_with_heuristics import match_bug_to_files
+from github_analysis_scripts.match_files_to_report_with_AI import VulnerabilityFileMatcher
 import requests
 import time
 from urllib.parse import urlparse, unquote
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+GITHUB_API_KEY = os.getenv("GITHUB_API_KEY")
 
 SMART_CONTRACT_EXTENSIONS = (
         '.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom'
@@ -42,7 +45,7 @@ def parse_github_url(github_url: str) -> Dict:
     return owner, repo, branch, subpath
 
 
-def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
+def find_files_up_commit_history(report, source_url, max_commits=5):
     """
     Walks up the commit history starting from the given source_url,
     checking each commit for relevant file changes until a match is found.
@@ -53,7 +56,7 @@ def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
         print(f"Error parsing GitHub URL: {e}")
         return [], None
         
-    headers = {"Authorization": f"token {api_key}"}
+    headers = {"Authorization": f"token {GITHUB_API_KEY}"}
     
     # Get commits for the entire repo, not just a specific path
     commits_url = f"https://api.github.com/repos/{owner}/{repo}/commits"
@@ -92,7 +95,7 @@ def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
             changed_files = [f["filename"] for f in commit_data.get("files", [])]
 
             # Match against report
-            matched_files = match_bug_to_files(report, set(changed_files), api_key)
+            matched_files = match_bug_to_files(report, set(changed_files), GITHUB_API_KEY)
             if matched_files:
                 return matched_files, commit_url
 
@@ -103,25 +106,19 @@ def find_files_up_commit_history(report, source_url, api_key, max_commits=5):
 
     return [], None
 
-def validate_github_api_key():
+def validate_api_keys():
     """Validate that GitHub API key is available."""
-    import os
     
-    api_key = os.getenv('GITHUB_API_KEY')
-    if not api_key:
+    if not GITHUB_API_KEY:
         print("Error: GITHUB_API_KEY environment variable is not set")
         print("Please set your GitHub API token: export GITHUB_API_KEY=your_token_here")
-        return None
-    return api_key
+        raise ValueError("GITHUB_API_KEY environment variable is required")
 
 
-def check_minimal_files(relevant_files_dict):
-    """Check if we have enough files to process matching."""
-    total_files = sum(len(files) for files in relevant_files_dict.values())
-    if total_files <= 1:
-        print(f"Only {total_files} total files found across all reports. No matching needed.")
-        return True, total_files
-    return False, total_files
+    if not OPENAI_API_KEY:
+        print("Error: OPENAI_API_KEY environment variable is not set")
+        print("Please set your GitHub API token: export OPENAI_API_KEY=your_token_here")
+        raise ValueError("OPENAI_API_KEY environment variable is required")
 
 
 def normalize_reports_data(reports):
@@ -154,14 +151,14 @@ def create_single_file_match(report, single_file_url, report_id):
     return matched_files
 
 
-def process_commit_history_matching(report, api_key):
+def process_commit_history_matching(report):
     """Handle matching for reports with no relevant files by checking commit history."""
     source_url = report.get("source_code_url", "") or report.get("fix_commit_url", "")
     if not source_url:
         return None, None
     
     print(f"  ⚠️ No relevant files found for {source_url}, walking commit history...")
-    matched_files, fix_commit = find_files_up_commit_history(report, source_url, api_key)
+    matched_files, fix_commit = find_files_up_commit_history(report, source_url)
     
     if matched_files and fix_commit:
         report["fix_commit_url"] = fix_commit
@@ -253,15 +250,13 @@ def assign_afflicted_blob_url(report, high_confidence_matches):
 
 
 
-def create_summary_result(report_id, report_title, report, top_match, from_commit_history, single_file_match):
+def create_summary_result(report_id, report_title, report, top_match):
     """Create a summary result entry for reporting."""
     return {
         'id': report_id,
         'title': report_title,
         'severity': report.get('severity', 'Unknown'),
         'top_match': top_match,
-        'from_commit_history': from_commit_history,
-        'single_file_match': single_file_match
     }
 
 
@@ -340,15 +335,10 @@ def print_summary_row(result):
     title = result['title'][:34] + '...' if len(result['title']) > 34 else result['title']
     
     if result['top_match']:
-        file_path = result['top_match']['file_path']
-        file_name = file_path.split('/')[-1][:29]  # Get filename, truncate if needed
-        score = f"{result['top_match']['total_score']:.1f}"
+        top_match = result["top_match"]
+        file_name = top_match.file_path.split('/')[-1][:29]  # Get filename, truncate if needed
+        score = f"{top_match.total_score:.1f}"
         
-        # Add indicators for special match types
-        if result['from_commit_history']:
-            file_name += " *"
-        elif result.get('single_file_match', False):
-            file_name += " ¹"
         
         print(f"{report_id:<8} {severity:<12} {title:<35} {file_name:<30} {score:<8}")
     else:
@@ -366,8 +356,6 @@ def print_statistics(summary_results):
     print(f"  High Confidence Matches (≥150): {successful_matches}")
     print(f"  No High Confidence Matches: {total_reports - successful_matches}")
     print(f"  High Confidence Rate: {(successful_matches/total_reports)*100:.1f}%")
-    
-    _print_special_match_statistics(summary_results)
     print(f"{'='*80}")
 
 
@@ -416,88 +404,110 @@ def print_final_summary(all_matches):
     print(f"\nTOTAL HIGH CONFIDENCE MATCHES RETURNED: {total_returned_matches}")
 
 
-def process_single_report(report, i, relevant_files_dict, api_key):
-    """Process a single bug report and return match results."""
-    report_title = report.get('title', f'Report_{i+1}')
-    report_id = report.get('id', f'ID_{i+1}')
-    
-    # Get the relevant files for this specific report
-    report_relevant_files = relevant_files_dict.get(report_title, [])
-        
-    print(f"\nProcessing report: {report_title}")
-    print(f"Found {len(report_relevant_files)} relevant files")
-    
-    # Initialize the afflicted_github_code_blob field
-    report['afflicted_github_code_blob'] = None
-    
-    # Handle single file case
-    if len(report_relevant_files) == 1:
-        matched_files = create_single_file_match(report, report_relevant_files[0], report_id)
-        assign_afflicted_blob_url(report, matched_files)
-        return matched_files, True, False  # matches, single_file_match, from_commit_history
-    
-    # Handle no files found - check commit history
-    if not report_relevant_files and (report.get("source_code_url", "") or report.get("fix_commit_url", "")):
-        matched_files, fix_commit = process_commit_history_matching(report, api_key)
-        
-        # Check for single positive match first
-        single_positive_matches = check_single_positive_match(matched_files)
-        
-        # If we found a single positive match, use it regardless of score
-        if single_positive_matches and len(single_positive_matches) == 1 and single_positive_matches != matched_files:
-            assign_afflicted_blob_url(report, single_positive_matches)
-            return single_positive_matches, False, True
-        
-        # Otherwise apply normal confidence filtering
-        high_confidence_matches = filter_high_confidence_matches(matched_files)
-        assign_afflicted_blob_url(report, high_confidence_matches)
-        return high_confidence_matches, False, True  # matches, single_file_match, from_commit_history
-    
-    # Multiple files - do full matching process
-    if report_relevant_files:
-        print(f"  → Running full matching process for {len(report_relevant_files)} files")
-        report_relevant_files_set = set(report_relevant_files)
-        matched_files = match_bug_to_files(report, report_relevant_files_set, api_key)
-        
-        # Check for single positive match first
-        single_positive_matches = check_single_positive_match(matched_files)
-        
-        # If we found a single positive match, use it regardless of score
-        if single_positive_matches and len(single_positive_matches) == 1 and single_positive_matches != matched_files:
-            assign_afflicted_blob_url(report, single_positive_matches)
-            print_match_results(report_title, matched_files, single_positive_matches)
-            return single_positive_matches, False, False
-        
-        # Otherwise apply normal confidence filtering
-        high_confidence_matches = filter_high_confidence_matches(matched_files)
-        
-        if matched_files and not high_confidence_matches:
-            print(f"  ⚠️ Found {len(matched_files)} matches but none scored 150+. Highest score: {matched_files[0]['total_score']:.1f}")
-        
-        assign_afflicted_blob_url(report, high_confidence_matches)
-        print_match_results(report_title, matched_files, high_confidence_matches)
-        
-        return high_confidence_matches, False, False  # matches, single_file_match, from_commit_history
-    
-    # No matches found
-    return [], False, False
+MAX_FILES_TO_CHECK = 20
+MAX_FIELD_LENGTH = 1000
 
+def truncate_field(value, default, max_len=MAX_FIELD_LENGTH):
+    """Return string value truncated to max_len, or default if None."""
+    val = value if value is not None else default
+    return str(val)[:max_len]
+
+def extract_report_fields(report, i):
+    """Extract and normalize key report fields."""
+    return {
+        "title": truncate_field(report.get('title'), f'Report_{i+1}'),
+        "id": truncate_field(report.get('id'), f'ID_{i+1}'),
+        "description": truncate_field(report.get('description', ''), ''),
+        "recommendation": truncate_field(report.get('recommendation', ''), ''),
+        "broken_code_snippets": truncate_field(report.get('broken_code_snippets', ''), '')
+    }
+
+def should_use_ai(report, relevant_files):
+    """Decide whether to use AI first, based on URLs and number of files."""
+    if report.get("fix_commit_url") and len(relevant_files) < MAX_FILES_TO_CHECK:
+        return "fix_commit"
+    elif report.get("source_code_url") and len(relevant_files) < MAX_FILES_TO_CHECK:
+        return "source_code"
+    return None
+
+def run_heuristics_matching(report, relevant_files):
+    """Run heuristics matching pipeline with confidence filtering."""
+    relevant_files_set = set(relevant_files)
+    matched_files = match_bug_to_files(report, relevant_files_set, GITHUB_API_KEY)
+
+    single_positive_matches = check_single_positive_match(matched_files)
+    if single_positive_matches and len(single_positive_matches) == 1 and single_positive_matches != matched_files:
+        assign_afflicted_blob_url(report, single_positive_matches)
+        print_match_results(report["title"], matched_files, single_positive_matches)
+        return single_positive_matches
+
+    high_confidence_matches = filter_high_confidence_matches(matched_files)
+    if matched_files and not high_confidence_matches:
+        print(f"  ⚠️ Found {len(matched_files)} matches but none scored 150+. "
+              f"Highest score: {matched_files[0]['total_score']:.1f}")
+
+    assign_afflicted_blob_url(report, high_confidence_matches)
+    print_match_results(report["title"], matched_files, high_confidence_matches)
+    return high_confidence_matches
+
+def process_single_report(report, i, relevant_files_dict):
+    """Process a single bug report and return match results."""
+
+    # Extract normalized fields
+    fields = extract_report_fields(report, i)
+    report.update(fields)  # overwrite with truncated values
+
+    # Get relevant files
+    relevant_files = relevant_files_dict.get(fields["title"], [])
+    print(f"\nProcessing report: {fields['title']}")
+    print(f"Found {len(relevant_files)} relevant files")
+
+    if not relevant_files:
+        return []
+
+    # Decide strategy
+    ai_strategy = should_use_ai(report, relevant_files)
+
+    if ai_strategy == "fix_commit":
+
+        #Use AI to check files that changed in the commit/pull for a match
+        matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+        matches = matcher.process_files(fields, relevant_files)
+
+        #No High Confidance Match? Check all smart contract files in repo in case the commit/pull is wrong
+        if not matches:
+            relevant_files = process_fix_url(report.get("fix_commit_url"), False)
+            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+            matches = matcher.process_files(fields, relevant_files)
+        
+        #Still no high confidance matches? Return empty
+        if not matches:
+            return []
+
+        return matches
+
+    elif ai_strategy == "source_code":
+        matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+        matches = matcher.process_files(fields, relevant_files)
+
+        if not matches:
+            return []
+
+        return matches
+
+    # Fallback: full matching
+    matches = run_heuristics_matching(report, relevant_files)
+    return matches
 
 def analyze_relevant_files(json_file):
     """Main function to process bug reports from JSON file and match them to files."""
     print(json_file)
 
-    # Validate GitHub API key
-    api_key = validate_github_api_key()
-    if not api_key:
-        return None
-    
+    validate_api_keys()
+
     # Get all relevant files AND the reports data from the JSON
     relevant_files_dict, reports = get_relevant_files(json_file)
-    
-    # Check if we have minimal files to process
-    is_minimal, total_files = check_minimal_files(relevant_files_dict)
-    
+        
     # Normalize reports data
     reports = normalize_reports_data(reports)
     
@@ -510,20 +520,23 @@ def analyze_relevant_files(json_file):
         report_id = report.get('id', f'ID_{i+1}')
         
         # Process the individual report
-        matched_files, single_file_match, from_commit_history = process_single_report(
-            report, i, relevant_files_dict, api_key
+        matched_files = process_single_report(
+            report, i, relevant_files_dict
         )
         
         # Store results
         all_matches[report_title] = matched_files
         
         # Add to summary
-        top_match = matched_files[0] if matched_files else None
         summary_result = create_summary_result(
-            report_id, report_title, report, top_match, 
-            from_commit_history, single_file_match
+            report_id, report_title, report, all_matches[report_title][0], 
         )
         summary_results.append(summary_result)
+
+        afflicted_code_blobs = []
+        for match in all_matches[report_title]:
+            afflicted_code_blobs.append(match.blob_url)
+        report["afflicted_github_code_blob"] = afflicted_code_blobs
     
     # Save updated JSON
     save_updated_reports(json_file, reports)
@@ -547,7 +560,7 @@ def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     
     # Use the CORRECT filename (note "copy.json" instead of ".json")
-    json_file = os.path.join(script_dir, "problems", "filtered_Myso Finance Lending Protocol_findings.json")
+    json_file = "test_dataset/0xGuard/filtered_Boltr-Farm_final-audit-report_polygon.json"
     
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"

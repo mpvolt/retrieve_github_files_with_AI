@@ -190,7 +190,8 @@ Respond in JSON format:
         
         # Sort by score (highest first)
         matches.sort(key=lambda x: x.total_score, reverse=True)
-        return matches
+        high_confidence_matches = [match for match in matches if match.total_score >= 85]
+        return high_confidence_matches
 
 
 def extract_function_names(file_path: str) -> List[str]:
@@ -227,7 +228,7 @@ def print_match_results(report_title: str, matched_files: List[FileMatch], high_
         for j, match in enumerate(matched_files[:3]):  # Show top 3 low-confidence matches
             print(f"  {j+1}. {match.file_path} (Score: {match.total_score:.1f}) - BELOW THRESHOLD")
     else:
-        print(f"High-confidence matches (60+ score):")
+        print(f"High-confidence matches (85+ score):")
         _print_high_confidence_matches(high_confidence_matches)
 
 
@@ -288,8 +289,8 @@ def main():
     # Process files
     matches = matcher.process_files(vulnerability_report, blob_urls)
     
-    # Filter high confidence matches (score >= 60)
-    high_confidence_matches = [match for match in matches if match.total_score >= 60]
+    # Filter high confidence matches (score >= 85)
+    high_confidence_matches = [match for match in matches if match.total_score >= 85]
     
     # Print results
     print_match_results(vulnerability_report['title'], matches, high_confidence_matches)
@@ -301,6 +302,7 @@ def main():
     print(f"\nSummary:")
     print(json.dumps(summary, indent=2))
     
+    print(f"Top match: {top_match}")
     return top_match
 
 

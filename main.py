@@ -1,4 +1,4 @@
-from analyze_relevant_files import analyze_relevant_files
+from analysis_scripts.analyze_relevant_files import analyze_relevant_files
 import os
 import json
 import time
@@ -153,7 +153,7 @@ def process_json_files_with_rate_limiting():
         rate_manager = GitHubRateLimitManager(api_key, min_requests_threshold=50)
         
         # Find all JSON files in subdirectories
-        json_files = find_json_files("omniscia")
+        json_files = find_json_files("/Users/matt/vulnaut/golden_dataset")
         
         if not json_files:
             logger.info("No JSON files found in subdirectories")
