@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 from fuzzywuzzy import fuzz
-from github_analysis_scripts.determine_relevant_files import get_relevant_files, process_fix_url, process_source_url
+from github_analysis_scripts.determine_relevant_files import get_relevant_files, process_fix_url, process_source_url, find_file_before_change
 from github_file_retrieval_scripts.retrieve_all_smart_contract_functions import extract_function_names
 from github_analysis_scripts.match_files_to_report_with_heuristics import match_bug_to_files
 from github_analysis_scripts.match_files_to_report_with_AI import VulnerabilityFileMatcher
@@ -446,9 +446,6 @@ def process_single_report(report, i, relevant_files_dict):
     print(f"\nProcessing report: {fields['title']}")
     print(f"Found {len(relevant_files)} relevant files")
 
-    if not relevant_files:
-        return []
-
     #Run heuristics matching to determine relevant files before processing with AI
     heuristics_processed_files = run_heuristics_matching(report, relevant_files)
     print(heuristics_processed_files)
@@ -475,12 +472,23 @@ def process_single_report(report, i, relevant_files_dict):
             relevant_files = process_fix_url(report.get("fix_commit_url"), False)
             matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
             matches = matcher.process_files(fields, relevant_files)
-        
+
         #Still no high confidance matches? Return empty
         if not matches:
             return []
 
         else:
+            #Commit url isn't necessary the one where the file was changed
+            #Determine the commit where the file was changed
+            for match in matches:
+                fix_commit_url = report.get("fix_commit_url", "")
+                if any(keyword in fix_commit_url for keyword in ["tree", "compare", "commit"]):
+                    # Call the renamed function
+                    original_blob_url = find_file_before_change(fix_commit_url, match.blob_url)
+                    
+                    # Only update if we found a valid result
+                    if original_blob_url and original_blob_url != "NEW FILE":
+                        match.blob_url = original_blob_url
             return matches
 
     elif ai_strategy == "source_code":
@@ -599,7 +607,7 @@ def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     
     # Use the CORRECT filename (note "copy.json" instead of ".json")
-    json_file = "/mnt/d/golden_dataset/electisec/filtered_01-2024-Inverse-sDOLA.json"
+    json_file = "/mnt/d/golden_dataset/bailsec/filtered_Bailsec - Defi Money Fee Module - Final Report.json"
     
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"

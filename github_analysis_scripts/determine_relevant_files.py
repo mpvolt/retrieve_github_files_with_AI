@@ -7,6 +7,7 @@ from github_file_retrieval_scripts.retrieve_all_smart_contract_files import get_
 from github_file_retrieval_scripts.retrieve_changed_commits_files import handle_commit_files_via_api
 from github_file_retrieval_scripts.retrieve_changed_pull_request_files import handle_pr_files_via_api
 from github_file_retrieval_scripts.retrieve_changed_compare_files import handle_compare_files_via_api
+from urllib.parse import urlparse
 
 
 SMART_CONTRACT_EXTENSIONS = (
@@ -251,6 +252,163 @@ def process_fix_url(fix_url: str, changed_files_only: bool) -> Set[str]:
     else:
         return relevant_files_set        
 
+GITHUB_API = "https://api.github.com"
+
+def normalize_to_commit(owner: str, repo: str, url: str, headers: dict) -> str:
+    """
+    Convert any GitHub tree/commit/pull/compare URL to a commit SHA.
+    """
+    parts = urlparse(url).path.strip("/").split("/")
+
+    if "commit" in parts:
+        # https://github.com/org/repo/commit/<sha>
+        return parts[parts.index("commit") + 1]
+
+    if "tree" in parts:
+        # https://github.com/org/repo/tree/<sha>
+        return parts[parts.index("tree") + 1]
+
+    if "pull" in parts:
+        # https://github.com/org/repo/pull/<number>
+        pr_number = parts[parts.index("pull") + 1]
+        pr_api = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}"
+        r = requests.get(pr_api, headers=headers)
+        r.raise_for_status()
+        return r.json()["head"]["sha"]
+
+    if "compare" in parts:
+        # https://github.com/org/repo/compare/base...head
+        compare_range = parts[parts.index("compare") + 1]
+        head = compare_range.split("...")[-1]
+        # Need to fetch compare API to resolve to a commit SHA
+        compare_api = f"{GITHUB_API}/repos/{owner}/{repo}/compare/{compare_range}"
+        r = requests.get(compare_api, headers=headers)
+        r.raise_for_status()
+        return r.json()["commits"][-1]["sha"]  # last commit in compare
+
+    raise ValueError("Unsupported GitHub URL type")
+
+
+def find_file_before_change(commit_url: str, blob_url: str, max_commits: int = 30, debug: bool = False) -> str | None:
+    """
+    Given a GitHub commit/tree/compare URL and a blob URL, finds where in the commit history
+    that file was changed and returns a blob link to the original version before the change.
+    
+    Starting from the given commit, walks backwards through history until it finds the commit
+    where the target file was actually modified, then returns the blob URL from the parent
+    commit (the version before the change).
+    
+    Args:
+        commit_url: GitHub commit/tree/compare URL to start searching from
+        blob_url: GitHub blob URL of the file to track
+        max_commits: Maximum number of commits to walk back through
+        debug: If True, print debug information during execution
+    
+    Returns:
+        Blob URL to the version of the file before it was changed, or None if not found
+        Returns "NEW FILE" if the file was added in the first commit found
+    """
+    token = os.getenv("GITHUB_API_KEY")
+    headers = {"Authorization": f"token {token}"} if token else {}
+
+    # Parse repo info from blob URL
+    blob_parts = urlparse(blob_url).path.strip("/").split("/")
+    owner, repo = blob_parts[0], blob_parts[1]
+    
+    # Extract filename from blob URL
+    # Format: /owner/repo/blob/sha/path/to/file
+    if len(blob_parts) < 5 or blob_parts[2] != "blob":
+        raise ValueError("Invalid blob URL format")
+    
+    file_path = "/".join(blob_parts[4:])  # everything after /blob/<sha>/
+    
+    if debug:
+        print(f"🔍 DEBUG: Looking for file: '{file_path}'")
+        print(f"🔍 DEBUG: Repo: {owner}/{repo}")
+        print(f"🔍 DEBUG: Blob URL parts: {blob_parts}")
+
+    # Normalize commit URL to a commit SHA
+    start_commit_sha = normalize_to_commit(owner, repo, commit_url, headers)
+    
+    if debug:
+        print(f"🔍 DEBUG: Starting from commit: {start_commit_sha}")
+
+    # Walk back through commit history starting from the given commit
+    current_sha = start_commit_sha
+    
+    for i in range(max_commits):
+        if debug:
+            print(f"\n🔍 DEBUG: Checking commit {i+1}/{max_commits}: {current_sha}")
+        
+        commit_api = f"{GITHUB_API}/repos/{owner}/{repo}/commits/{current_sha}"
+        r = requests.get(commit_api, headers=headers)
+        r.raise_for_status()
+        commit_data = r.json()
+        
+        commit_message = commit_data.get("commit", {}).get("message", "").split('\n')[0][:60]
+        if debug:
+            print(f"🔍 DEBUG: Commit message: {commit_message}")
+
+        # Check if this commit modified our target file
+        files = commit_data.get("files", [])
+        if debug:
+            print(f"🔍 DEBUG: This commit changed {len(files)} files:")
+            for f in files:
+                print(f"    - {f['filename']} (status: {f.get('status', 'unknown')})")
+                if f.get('previous_filename'):
+                    print(f"      (previously: {f['previous_filename']})")
+        
+        file_was_changed_in_this_commit = False
+        
+        for f in files:
+            # Check if this file matches our target (current name or previous name if renamed)
+            if f["filename"] == file_path or f.get("previous_filename") == file_path:
+                file_was_changed_in_this_commit = True
+                
+                if debug:
+                    print(f"🎯 DEBUG: FOUND! File '{file_path}' was changed in this commit!")
+                    print(f"    File status: {f.get('status', 'unknown')}")
+                    print(f"    Changes: +{f.get('additions', 0)} -{f.get('deletions', 0)}")
+                
+                # Found the commit that changed this file
+                if not commit_data["parents"]:
+                    # This is a root commit, file was added here
+                    if debug:
+                        print(f"🔍 DEBUG: This is a root commit - file was added here")
+                    return "NEW FILE"
+
+                # Get the parent commit to find the "before" version
+                parent_sha = commit_data["parents"][0]["sha"]
+                
+                # Use the previous filename if the file was renamed, otherwise use current name
+                before_path = f.get("previous_filename", f["filename"])
+                before_blob_url = f"https://github.com/{owner}/{repo}/blob/{parent_sha}/{before_path}"
+                
+                if debug:
+                    print(f"🎯 DEBUG: Returning blob URL from parent commit {parent_sha}")
+                    print(f"🎯 DEBUG: Before path: {before_path}")
+                    print(f"🎯 DEBUG: Final URL: {before_blob_url}")
+                
+                return before_blob_url
+
+        # If file wasn't changed in this commit, continue to parent
+        if not file_was_changed_in_this_commit:
+            if debug:
+                print(f"🔍 DEBUG: File not changed in this commit, moving to parent...")
+            
+            parents = commit_data.get("parents", [])
+            if not parents:
+                # Reached root commit without finding the file change
+                if debug:
+                    print(f"🔍 DEBUG: Reached root commit without finding file change")
+                break
+            current_sha = parents[0]["sha"]
+
+    # File change not found within the commit limit
+    if debug:
+        print(f"🔍 DEBUG: File change not found within {max_commits} commits")
+    return None
+
 def filter_test_files(file_urls: Set[str]) -> List[str]:
     """
     Filter out test files from the set of file URLs.
@@ -370,12 +528,16 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
 
 def main():
-    json_file = "/mnt/d/golden_dataset/electisec/filtered_01-2024-Inverse-sDOLA.json"
-
+    json_file = "/mnt/d/golden_dataset/bailsec/filtered_Bailsec - Defi Money Fee Module - Final Report.json"
 
     # Load JSON file
-    results = get_relevant_files(json_file)
+    #results = get_relevant_files(json_file)
     #print(results)
+    find_file_before_change(
+    "https://github.com/defidotmoney/dfm-contracts/commit/9757a634244ab35b1a97797040e699e038158e92",
+    "https://github.com/defidotmoney/dfm-contracts/blob/9757a634244ab35b1a97797040e699e038158e92/contracts/fees/dependencies/FeeConverterBase.sol",
+    debug=True
+)
 
 
 if __name__ == "__main__":
