@@ -26,6 +26,8 @@ class FileMatch:
     content_preview: str = ""
 
 
+MIN_THRESHOLD = 75
+
 class VulnerabilityFileMatcher:
     """Main class for matching vulnerability reports to source files."""
     
@@ -155,6 +157,7 @@ Respond in JSON format:
                 "key_matches": []
             }
     
+
     def process_files(self, vulnerability_report: Dict[str, Any], blob_urls: List[str]) -> List[FileMatch]:
         """Process all files and return sorted matches."""
         matches = []
@@ -190,7 +193,7 @@ Respond in JSON format:
         
         # Sort by score (highest first)
         matches.sort(key=lambda x: x.total_score, reverse=True)
-        high_confidence_matches = [match for match in matches if match.total_score >= 85]
+        high_confidence_matches = [match for match in matches if match.total_score >= MIN_THRESHOLD]
         return high_confidence_matches
 
 
@@ -290,7 +293,7 @@ def main():
     matches = matcher.process_files(vulnerability_report, blob_urls)
     
     # Filter high confidence matches (score >= 85)
-    high_confidence_matches = [match for match in matches if match.total_score >= 85]
+    high_confidence_matches = [match for match in matches if match.total_score >= MIN_THRESHOLD]
     
     # Print results
     print_match_results(vulnerability_report['title'], matches, high_confidence_matches)

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 from fuzzywuzzy import fuzz
-from github_analysis_scripts.determine_relevant_files import get_relevant_files, process_fix_url
+from github_analysis_scripts.determine_relevant_files import get_relevant_files, process_fix_url, process_source_url
 from github_file_retrieval_scripts.retrieve_all_smart_contract_functions import extract_function_names
 from github_analysis_scripts.match_files_to_report_with_heuristics import match_bug_to_files
 from github_analysis_scripts.match_files_to_report_with_AI import VulnerabilityFileMatcher
@@ -166,26 +166,6 @@ def process_commit_history_matching(report):
     return matched_files, fix_commit
 
 
-def filter_high_confidence_matches(matched_files, threshold=150.0):
-    """Filter matches to only include those above the confidence threshold.
-    If only one file scored above 0, include it regardless of threshold."""
-    if not matched_files:
-        return []
-    
-    # Check if there's only one file with a positive score
-    positive_matches = [match for match in matched_files if match['total_score'] > 0]
-    
-    # If only one positive match, return it regardless of threshold
-    if len(positive_matches) == 1:
-        single_match = positive_matches[0]
-        if single_match['total_score'] < threshold:
-            # Add a note that this was included despite being below threshold
-            if 'Single positive match among all candidates' not in single_match.get('match_reasons', []):
-                single_match['match_reasons'] = single_match.get('match_reasons', []) + [f'Only file with positive score ({single_match["total_score"]:.1f})']
-        return [single_match]
-    
-    # Otherwise, apply normal threshold filtering
-    return [match for match in matched_files if match['total_score'] >= threshold]
 
 
 def check_single_positive_match(matched_files):
@@ -359,19 +339,6 @@ def print_statistics(summary_results):
     print(f"{'='*80}")
 
 
-def _print_special_match_statistics(summary_results):
-    """Print statistics for special match types (commit history and single file)."""
-    if any(result['from_commit_history'] for result in summary_results):
-        commit_matches = sum(1 for result in summary_results 
-                           if result['from_commit_history'] and result['top_match'])
-        print(f"  High Confidence from Commit History: {commit_matches} (marked with *)")
-    
-    if any(result.get('single_file_match', False) for result in summary_results):
-        single_file_matches = sum(1 for result in summary_results 
-                                if result.get('single_file_match', False))
-        print(f"  Single File Auto-Matches: {single_file_matches} (marked with ¹)")
-
-
 def print_severity_breakdown(summary_results):
     """Print breakdown of matches by severity level."""
     severity_stats = {}
@@ -430,24 +397,41 @@ def should_use_ai(report, relevant_files):
         return "source_code"
     return None
 
+MIN_HEURISTICS_THRESHOLD = 20
+
+def filter_high_confidence_matches(matched_files, threshold=MIN_HEURISTICS_THRESHOLD):
+    """Filter matches to only include those above the confidence threshold.
+    If only one file scored above 0, include it regardless of threshold."""
+    if not matched_files:
+        return []
+    
+    # Check if there's only one file with a positive score
+    positive_matches = [match for match in matched_files if match['total_score'] > 0]
+    
+    # If only one positive match, return it regardless of threshold
+    if len(positive_matches) == 1:
+        single_match = positive_matches[0]
+        if single_match['total_score'] < threshold:
+            # Add a note that this was included despite being below threshold
+            if 'Single positive match among all candidates' not in single_match.get('match_reasons', []):
+                single_match['match_reasons'] = single_match.get('match_reasons', []) + [f'Only file with positive score ({single_match["total_score"]:.1f})']
+        return [single_match["blob_url"]]
+    
+    # Otherwise, apply normal threshold filtering
+    return [match["blob_url"] for match in matched_files if match['total_score'] >= threshold]
+
 def run_heuristics_matching(report, relevant_files):
     """Run heuristics matching pipeline with confidence filtering."""
     relevant_files_set = set(relevant_files)
     matched_files = match_bug_to_files(report, relevant_files_set, GITHUB_API_KEY)
 
-    single_positive_matches = check_single_positive_match(matched_files)
-    if single_positive_matches and len(single_positive_matches) == 1 and single_positive_matches != matched_files:
-        assign_afflicted_blob_url(report, single_positive_matches)
-        print_match_results(report["title"], matched_files, single_positive_matches)
-        return single_positive_matches
-
     high_confidence_matches = filter_high_confidence_matches(matched_files)
     if matched_files and not high_confidence_matches:
-        print(f"  ⚠️ Found {len(matched_files)} matches but none scored 150+. "
+        print(f"  ⚠️ Found {len(matched_files)} matches but none scored above the threshold"
               f"Highest score: {matched_files[0]['total_score']:.1f}")
 
-    assign_afflicted_blob_url(report, high_confidence_matches)
-    print_match_results(report["title"], matched_files, high_confidence_matches)
+    #assign_afflicted_blob_url(report, high_confidence_matches)
+    #print_match_results(report["title"], matched_files, high_confidence_matches)
     return high_confidence_matches
 
 def process_single_report(report, i, relevant_files_dict):
@@ -465,17 +449,29 @@ def process_single_report(report, i, relevant_files_dict):
     if not relevant_files:
         return []
 
-    # Decide strategy
-    ai_strategy = should_use_ai(report, relevant_files)
+    #Run heuristics matching to determine relevant files before processing with AI
+    heuristics_processed_files = run_heuristics_matching(report, relevant_files)
+    print(heuristics_processed_files)
+    print(f"Heuristics Matching returned {len(heuristics_processed_files)}, now using GPT4.1")
 
+    # Decide strategy
+    ai_strategy = should_use_ai(report, heuristics_processed_files)
+    
     if ai_strategy == "fix_commit":
 
-        #Use AI to check files that changed in the commit/pull for a match
-        matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-        matches = matcher.process_files(fields, relevant_files)
+        #Use AI to check files that were returned by heuristics matching 
+        if heuristics_processed_files:
+            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+            matches = matcher.process_files(fields, heuristics_processed_files)
 
-        #No High Confidance Match? Check all smart contract files in repo in case the commit/pull is wrong
-        if not matches:
+            #No High Confidance Match? Check all smart contract files in repo in case the commit/pull is wrong
+            if not matches:
+                relevant_files = process_fix_url(report.get("fix_commit_url"), False)
+                matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+                matches = matcher.process_files(fields, relevant_files)
+        
+        #No Heuristics matched files? default to AI to check them all
+        else:
             relevant_files = process_fix_url(report.get("fix_commit_url"), False)
             matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
             matches = matcher.process_files(fields, relevant_files)
@@ -484,20 +480,33 @@ def process_single_report(report, i, relevant_files_dict):
         if not matches:
             return []
 
-        return matches
+        else:
+            return matches
 
     elif ai_strategy == "source_code":
-        matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-        matches = matcher.process_files(fields, relevant_files)
+
+        if heuristics_processed_files:
+            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+            matches = matcher.process_files(fields, heuristics_processed_files)
+
+            if not matches:
+                relevant_files = process_source_url(report.get("source_code_url"))
+                matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+                matches = matcher.process_files(fields, relevant_files)
+
+        else:
+            relevant_files = process_source_url(report.get("source_code_url"))
+            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+            matches = matcher.process_files(fields, relevant_files)
 
         if not matches:
             return []
 
-        return matches
+        else: 
+            return matches
 
-    # Fallback: full matching
-    matches = run_heuristics_matching(report, relevant_files)
-    return matches
+    else:
+        return []
 
 def analyze_relevant_files(json_file):
     """Main function to process bug reports from JSON file and match them to files."""
@@ -516,14 +525,41 @@ def analyze_relevant_files(json_file):
     
     # Process each report
     for i, report in enumerate(reports):
-        report_title = report.get('title', f'Report_{i+1}')
-        report_id = report.get('id', f'ID_{i+1}')
-        
-        # Process the individual report
+
+        # ✅ Skip processing if afflicted_github_code_blob already exists and is non-empty
+        if report.get("afflicted_github_code_blob"):
+            print(f"Report {report.get('id', i)} already has afflicted_github_code_blob, skipping..")
+            continue
+
+        # ✅ Check if report has a source_code_url field
+        source_code_url = report.get("source_code_url")
+        afflicted_code_blobs = []
+
+        if source_code_url:
+            # Handle both string and list cases
+            urls_to_check = source_code_url if isinstance(source_code_url, list) else [source_code_url]
+
+            for url in urls_to_check:
+                if isinstance(url, str) and "github.com" in url and "/blob/" in url:
+                    afflicted_code_blobs.append(url)
+
+            if afflicted_code_blobs:
+                # Assign afflicted_github_code_blob and skip normal processing
+                report["afflicted_github_code_blob"] = afflicted_code_blobs
+                print("Source code is already github blob, skipping..")
+                continue  # Skip the normal matching logic
+
+        # Process the individual report if no valid blob links found
         matched_files = process_single_report(
             report, i, relevant_files_dict
         )
+
+        if not matched_files:
+            continue
         
+        report_title = report.get('title', f'Report_{i+1}')
+        report_id = report.get('id', f'ID_{i+1}')
+
         # Store results
         all_matches[report_title] = matched_files
         
@@ -544,23 +580,26 @@ def analyze_relevant_files(json_file):
     # Print comprehensive summary
     print_summary_header()
     
-    # Print each result row
-    for result in summary_results:
-        print_summary_row(result)
-    
-    # Print statistics
-    print_statistics(summary_results)
-    print_severity_breakdown(summary_results)
-    print_blob_assignment_summary(reports)
-    print_final_summary(all_matches)
-    
-    return all_matches  # Returns ONLY high confidence matches (150+ score)
+    if summary_results:
+        # Print each result row
+        for result in summary_results:
+            print_summary_row(result)
+        
+        # Print statistics
+        print_statistics(summary_results)
+        print_severity_breakdown(summary_results)
+        print_blob_assignment_summary(reports)
+        print_final_summary(all_matches)
+        
+    return all_matches  # Returns ONLY high confidence matches
+
+
 
 def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     
     # Use the CORRECT filename (note "copy.json" instead of ".json")
-    json_file = "test_dataset/0xGuard/filtered_Boltr-Farm_final-audit-report_polygon.json"
+    json_file = "/mnt/d/golden_dataset/electisec/filtered_01-2024-Inverse-sDOLA.json"
     
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"

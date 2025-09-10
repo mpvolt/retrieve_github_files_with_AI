@@ -1,4 +1,5 @@
-from analysis_scripts.analyze_relevant_files import analyze_relevant_files
+import traceback
+from github_analysis_scripts.analyze_relevant_files import analyze_relevant_files
 import os
 import json
 import time
@@ -6,6 +7,7 @@ import requests
 from pathlib import Path
 from typing import Optional, Dict, Any
 import logging
+import concurrent.futures
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -86,13 +88,18 @@ class GitHubRateLimitManager:
         return True
 
 
-def find_json_files(root_dir: str = ".") -> list[Path]:
+from pathlib import Path
+
+def find_json_files(root_dir: str = ".", start_dir: str = None) -> list[Path]:
     """
-    Find all JSON files in the current directory and all subdirectories
+    Find all JSON files in the current directory and all subdirectories.
+    Optionally start from a directory (alphabetical order).
     
     Args:
         root_dir: Root directory to search from
-        
+        start_dir: Optional starting directory name (alphabetical filter). 
+                   Example: "e" → skips a-d
+    
     Returns:
         List of Path objects for JSON files found, sorted for consistent processing
     """
@@ -100,28 +107,33 @@ def find_json_files(root_dir: str = ".") -> list[Path]:
     json_files = []
     
     try:
-        # Search current directory and all subdirectories recursively
-        # Using rglob to find all .json files regardless of case (important for cross-platform)
+        # Search recursively for JSON files
         json_files = list(root_path.rglob("*.json"))
-        
-        # Also check for .JSON files (uppercase extension) for Windows compatibility
         json_files.extend(root_path.rglob("*.JSON"))
         
-        # Remove duplicates (in case a file matches both patterns)
+        # Remove duplicates
         json_files = list(set(json_files))
         
-        # Sort files for consistent processing order across platforms
+        # Sort consistently
         json_files.sort()
         
-        # Filter out any files that might not actually exist (edge case)
+        # Filter out invalid paths
         json_files = [f for f in json_files if f.exists() and f.is_file()]
+        
+        # ✅ Apply start_dir filter if provided
+        if start_dir:
+            start_dir = start_dir.lower()
+            json_files = [
+                f for f in json_files 
+                if f.parts[len(root_path.parts)].lower() >= start_dir
+            ]
         
         logger.info(f"Found {len(json_files)} JSON files in {root_path} and its subdirectories")
         
-        # Debug: Show first few files found
+        # Debug: Show first few files
         if json_files:
             logger.debug(f"First few JSON files found:")
-            for i, file in enumerate(json_files[:5]):  # Show first 5
+            for i, file in enumerate(json_files[:5]):
                 logger.debug(f"  {i+1}. {file}")
             if len(json_files) > 5:
                 logger.debug(f"  ... and {len(json_files) - 5} more files")
@@ -134,149 +146,138 @@ def find_json_files(root_dir: str = ".") -> list[Path]:
         return []
     
     return json_files
- 
 
-def process_json_files_with_rate_limiting():
+ 
+def process_single_json_file(json_file_str, original_cwd, rate_manager, max_retries=3):
     """
-    Main function that processes all JSON files in subdirectories while managing GitHub API rate limits
+    Worker function to process a single JSON file.
+    Returns (success: bool, file: str) for aggregation.
     """
-    # Save the original working directory
-    original_cwd = os.getcwd()
-    
+
     try:
-        # Get GitHub API key from environment
+        # Check rate limit before starting
+        if not rate_manager.check_and_wait_if_needed(f"before processing {json_file_str}"):
+            return False, json_file_str
+
+        # Validate JSON
+        try:
+            with open(json_file_str, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.warning(f"Skipping invalid JSON file {json_file_str}: {e}")
+            return False, json_file_str
+
+        # Skip if no relevant fields
+        if not any(
+            key in obj
+            for obj in (data if isinstance(data, list) else [data])
+            for key in ("source_code_url", "fix_commit_url", "afflicted_github_code_blob")
+        ):
+            logger.info(f"Skipping {json_file_str}: no relevant fields")
+            return True, json_file_str  # Not an error, just skipped
+
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                # Check rate limit again before expensive operation
+                if not rate_manager.check_and_wait_if_needed(f"during processing {json_file_str}"):
+                    raise Exception("Rate limit check failed")
+
+                # Ensure correct working directory
+                try:
+                    if os.getcwd() != original_cwd:
+                        os.chdir(original_cwd)
+                except FileNotFoundError:
+                    if os.path.exists(original_cwd):
+                        os.chdir(original_cwd)
+
+                success = analyze_relevant_files(json_file_str)
+                if success is not None:
+                    logger.info(f"Successfully processed {json_file_str}")
+                    return True, json_file_str
+                else:
+                    retry_count += 1
+                    logger.warning(f"analyze_relevant_files() returned None for {json_file_str}, retrying...")
+                    time.sleep(5)
+
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"Error processing {json_file_str} (attempt {retry_count}): {e}")
+                logger.debug(traceback.format_exc())
+                time.sleep(10)
+
+        # Retries exhausted
+        logger.error(f"Failed to process {json_file_str} after {max_retries} attempts")
+        return False, json_file_str
+
+    except Exception as e:
+        logger.error(f"Unexpected error in worker for {json_file_str}: {e}")
+        return False, json_file_str
+
+
+def process_json_files_with_rate_limiting_parallel():
+    """
+    Main function that processes all JSON files in subdirectories in parallel
+    while managing GitHub API rate limits.
+    """
+    original_cwd = os.getcwd()
+
+    try:
         api_key = os.getenv('GITHUB_API_KEY')
         if not api_key:
             raise ValueError("GITHUB_API_KEY environment variable is not set")
-        
-        # Initialize rate limit manager
+
+        # Shared rate limit manager (thread-safe)
         rate_manager = GitHubRateLimitManager(api_key, min_requests_threshold=50)
-        
-        # Find all JSON files in subdirectories
-        json_files = find_json_files("/Users/matt/vulnaut/golden_dataset")
-        
+
+        # Find all JSON files
+        json_files = find_json_files("/mnt/d/golden_dataset")
         if not json_files:
-            logger.info("No JSON files found in subdirectories")
+            logger.info("No JSON files found")
             return
-        
+
         processed_count = 0
-        failed_count = 0
-        
-        for json_file in json_files:
-            try:
-                # Convert Path object to absolute string path for cross-platform compatibility
-                json_file_str = str(json_file.resolve())
-                
-                logger.info(f"Processing file {processed_count + 1}/{len(json_files)}: {json_file}")
-                logger.debug(f"Resolved path: {json_file_str}")
-                
-                # Safely verify and restore working directory
+        failed_files = set()
+
+        # Use ThreadPoolExecutor for I/O + network concurrency
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_file = {
+                executor.submit(process_single_json_file, str(f.resolve()), original_cwd, rate_manager): f
+                for f in json_files
+            }
+
+            for future in concurrent.futures.as_completed(future_to_file):
+                json_file = str(future_to_file[future])
                 try:
-                    current_dir = os.getcwd()
-                    if current_dir != original_cwd:
-                        logger.warning(f"Working directory changed, restoring to {original_cwd}")
-                        os.chdir(original_cwd)
-                except FileNotFoundError:
-                    logger.warning("Current working directory no longer exists, restoring to original")
-                    if os.path.exists(original_cwd):
-                        os.chdir(original_cwd)
+                    success, file_path = future.result()
+                    if success:
+                        processed_count += 1
                     else:
-                        logger.error(f"Original directory {original_cwd} also missing, using home directory")
-                        os.chdir(os.path.expanduser('~'))
-                
-                # Check rate limit before processing each file
-                if not rate_manager.check_and_wait_if_needed(f"before processing {json_file}"):
-                    logger.error(f"Failed to check rate limit for {json_file}, skipping...")
-                    failed_count += 1
-                    continue
-                
-                # Validate JSON file before processing using the resolved path
-                try:
-                    with open(json_file_str, 'r', encoding='utf-8') as f:
-                        json.load(f)  # Validate JSON syntax
-                except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                    logger.warning(f"Skipping invalid JSON file {json_file}: {e}")
-                    failed_count += 1
-                    continue
-                
-                # Process the file
-                max_retries = 3
-                retry_count = 0
-                
-                while retry_count < max_retries:
-                    try:
-                        # Check rate limit again right before the potentially expensive operation
-                        if not rate_manager.check_and_wait_if_needed(f"during processing {json_file}"):
-                            raise Exception("Rate limit check failed")
-                        
-                        # Safely ensure we're still in the correct directory
-                        try:
-                            current_dir = os.getcwd()
-                            if current_dir != original_cwd:
-                                logger.warning(f"Working directory changed during processing, restoring to {original_cwd}")
-                                os.chdir(original_cwd)
-                        except FileNotFoundError:
-                            logger.warning("Working directory missing during processing, restoring to original")
-                            if os.path.exists(original_cwd):
-                                os.chdir(original_cwd)
-                        
-                        # Call analyze_relevant_files with the resolved string path
-                        success = analyze_relevant_files(json_file_str)
-                        
-                        if success is not None:
-                            processed_count += 1
-                            logger.info(f"Successfully processed {json_file}")
-                            break
-                        else:
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                logger.warning(f"analyze_relevant_files() returned None for {json_file}, retrying...")
-                                time.sleep(5)
-                            
-                    except Exception as e:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            logger.warning(f"Error processing {json_file} (attempt {retry_count}): {e}")
-                            time.sleep(10)
-                        else:
-                            logger.error(f"Failed to process {json_file} after {max_retries} attempts: {e}")
-                            failed_count += 1
-                            break
-                else:
-                    if retry_count >= max_retries:
-                        failed_count += 1
-                        continue
-                
-                time.sleep(0.5)
-                
-            except KeyboardInterrupt:
-                logger.info("Process interrupted by user")
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error processing {json_file}: {e}")
-                failed_count += 1
-        
-        logger.info(f"Processing complete: {processed_count} successful, {failed_count} failed")
-        
+                        failed_files.add(file_path)
+                except Exception as e:
+                    logger.error(f"Unhandled exception processing {json_file}: {e}")
+                    failed_files.add(json_file)
+
+        logger.info(f"Processing complete: {processed_count} successful, {len(failed_files)} failed")
+
+        error_file_path = "errors.txt"
+        with open(error_file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(failed_files))
+
     finally:
-        # Safely restore the original working directory
         try:
-            current_dir = os.getcwd()
-            if current_dir != original_cwd:
-                logger.info(f"Restoring working directory to {original_cwd}")
+            if os.getcwd() != original_cwd:
                 os.chdir(original_cwd)
         except FileNotFoundError:
-            logger.warning("Cannot restore working directory - it no longer exists")
             if os.path.exists(original_cwd):
                 os.chdir(original_cwd)
-                logger.info(f"Successfully restored to {original_cwd}")
 
 def main():
     """Entry point for the script"""
     start_time = time.time()
     
     try:
-        process_json_files_with_rate_limiting()
+        process_json_files_with_rate_limiting_parallel()
     except Exception as e:
         logger.error(f"Script failed: {e}")
         raise

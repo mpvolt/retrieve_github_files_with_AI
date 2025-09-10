@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 
-import argparse
 import json
 import os
-import re
-import shutil
-import subprocess
-import tempfile
 import requests
-from urllib.parse import urlparse
 from github_file_retrieval_scripts.retrieve_all_smart_contract_files import get_smart_contracts
 from github_file_retrieval_scripts.retrieve_changed_commits_files import handle_commit_files_via_api
 from github_file_retrieval_scripts.retrieve_changed_pull_request_files import handle_pr_files_via_api
 from github_file_retrieval_scripts.retrieve_changed_compare_files import handle_compare_files_via_api
-from github_file_retrieval_scripts.retrieve_all_smart_contract_functions import extract_function_names
 
 
 SMART_CONTRACT_EXTENSIONS = (
@@ -222,7 +215,7 @@ def process_fix_url(fix_url: str, changed_files_only: bool) -> Set[str]:
         result = handle_pr_files_via_api(fix_url)
         for file_info in result['files']:
             relevant_files_set.add(file_info['old_blob_url'])
-        github_tree_url = result['base_branch']
+        github_tree_url = result['earliest_tree_url']
 
     elif 'compare' in fix_url:
         print("Processing compare url, retrieving changed files")
@@ -239,6 +232,13 @@ def process_fix_url(fix_url: str, changed_files_only: bool) -> Set[str]:
             relevant_files_set.add(file_info['older_file_url'])
         github_tree_url = result['older_tree_url']
     
+    elif 'blob' in fix_url:
+        fix_url = fix_url.replace("/blob/", "/commit/")
+        result = handle_commit_files_via_api(fix_url)
+        for file_info in result['files']:
+            relevant_files_set.add(file_info['older_file_url'])
+        github_tree_url = result['older_tree_url']
+
     all_files = set()
 
     if github_tree_url and not changed_files_only:
@@ -289,9 +289,7 @@ def process_single_report(report: Dict[str, Any], report_index: int, processed_u
         print("Error: JSON must contain either 'source_code_url' or 'fix_commit_url'.")
         return report_title, []
     
-    # Extract search data (for future semantic analysis)
-    search_json_str = extract_search_data(report)
-    
+    # Extract search data (for future semantic analysis)    
     relevant_files_set = set()
 
     # If the source url exists and is already a blob, no processing needed
@@ -372,7 +370,7 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
 
 def main():
-    json_file = "test_dataset/0xGuard/filtered_Boltr-Farm_final-audit-report_polygon.json"
+    json_file = "/mnt/d/golden_dataset/electisec/filtered_01-2024-Inverse-sDOLA.json"
 
 
     # Load JSON file

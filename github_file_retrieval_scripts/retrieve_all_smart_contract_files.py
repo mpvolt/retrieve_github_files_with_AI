@@ -54,6 +54,7 @@ SMART_CONTRACT_EXTENSIONS = {
     '.circom': 'ZK Circuits'
 }
 
+
 class GitHubGraphQLRetriever:
     def __init__(self, api_key: str):
         """Initialize with GitHub API token (required for GraphQL)."""
@@ -391,6 +392,104 @@ class GitHubGraphQLRetriever:
             
             return smart_contract_files
 
+class GitHubRestRetriever:
+    def __init__(self, api_key: str):
+        """Initialize with GitHub API token (required for REST API)."""
+        if not api_key:
+            raise ValueError("GitHub API token is required for REST API")
+
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'token {api_key}',
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'SmartContract-REST-Retriever/1.0'
+        })
+
+    def is_smart_contract_file(self, filename: str) -> Tuple[bool, str]:
+        """Check if file is a smart contract based on extension."""
+        filename_lower = filename.lower()
+        for ext, language in SMART_CONTRACT_EXTENSIONS.items():
+            if filename_lower.endswith(ext.lower()):
+                return True, language
+        return False, ''
+
+    def get_commit_sha(self, owner: str, repo: str, branch: str) -> Optional[str]:
+        """Resolve branch to commit SHA using REST API."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}"
+        resp = self.session.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()["commit"]["sha"]
+        return None
+
+    def get_repo_tree(self, owner: str, repo: str, sha: str) -> Optional[List[Dict]]:
+        """Fetch the full repo tree (recursive) from REST API."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
+        resp = self.session.get(url, timeout=30)
+        if resp.status_code == 200:
+            return resp.json().get("tree", [])
+        return None
+
+    def get_file_content(self, owner: str, repo: str, path: str, ref: str) -> Optional[str]:
+        """Fetch file content (decoded from base64) via REST API."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+        resp = self.session.get(url, timeout=30)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("encoding") == "base64":
+                import base64
+                try:
+                    content = base64.b64decode(data["content"]).decode("utf-8", errors="ignore")
+                    return content
+                except Exception:
+                    return None
+        return None
+
+    def get_smart_contracts(self, owner: str, repo: str, branch: str, verbose: bool = True) -> List[Dict]:
+        """Get smart contracts using REST API."""
+        if verbose:
+            print(f"Using REST API for {owner}/{repo}@{branch}")
+
+        sha = self.get_commit_sha(owner, repo, branch)
+        if not sha:
+            raise Exception("Failed to resolve branch to commit SHA")
+
+        tree = self.get_repo_tree(owner, repo, sha)
+        if not tree:
+            raise Exception("Failed to fetch repository tree")
+
+        smart_contract_files = []
+        for item in tree:
+            if item["type"] != "blob":
+                continue
+
+            filename = item["path"].split("/")[-1]
+            is_contract, language = self.is_smart_contract_file(filename)
+            if not is_contract:
+                continue
+
+            # Fetch file content
+            content = self.get_file_content(owner, repo, item["path"], sha)
+            if not content or len(content.strip()) < 10:
+                continue
+
+            smart_contract_files.append({
+                "name": filename,
+                "path": item["path"],
+                "content": content,
+                "size": len(content),
+                "language": language,
+                "lines": len(content.splitlines()),
+                "is_valid": True
+            })
+
+        if verbose:
+            print(f"REST found {len(smart_contract_files)} smart contract files")
+
+        return smart_contract_files
+
+
 def parse_github_url(github_url: str) -> Dict:
     """Parse GitHub URL and extract components."""
     url = github_url.rstrip('/').replace('.git', '')
@@ -485,12 +584,12 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
         
         # STEP 2: Use REST fallback if needed
         if not graphql_succeeded:
-            fallback = GitHubRestFallback(api_key)
+            fallback = GitHubRestRetriever(api_key)
             commit_sha = fallback.get_commit_sha(owner, repo, branch)
             
             if commit_sha:
-                rest_files = fallback.get_smart_contracts_rest(
-                    owner, repo, commit_sha, subpath, verbose
+                rest_files = fallback.get_smart_contracts(
+                    owner, repo, commit_sha, verbose
                 )
                 
                 if rest_files:
