@@ -380,14 +380,13 @@ def truncate_field(value, default, max_len=MAX_FIELD_LENGTH):
     return str(val)[:max_len]
 
 def extract_report_fields(report, i):
-    """Extract and normalize key report fields."""
-    return {
-        "title": truncate_field(report.get('title'), f'Report_{i+1}'),
-        "id": truncate_field(report.get('id'), f'ID_{i+1}'),
-        "description": truncate_field(report.get('description', ''), ''),
-        "recommendation": truncate_field(report.get('recommendation', ''), ''),
-        "broken_code_snippets": truncate_field(report.get('broken_code_snippets', ''), '')
-    }
+    """Extract and normalize all fields from a report dynamically."""
+    fields = {}
+    for key, value in report.items():
+        # Use key-based default like Report_{i+1}, ID_{i+1}, etc.
+        default_value = f'{key}_{i+1}' if value is None else ''
+        fields[key] = truncate_field(value, default_value)
+    return fields
 
 def should_use_ai(report, relevant_files):
     """Decide whether to use AI first, based on URLs and number of files."""
