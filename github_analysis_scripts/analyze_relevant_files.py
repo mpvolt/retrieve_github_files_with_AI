@@ -1,4 +1,5 @@
 import json
+from multiprocessing import context
 import re
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ from github_analysis_scripts.determine_relevant_files import get_relevant_files,
 from github_file_retrieval_scripts.retrieve_all_smart_contract_functions import extract_function_names
 from github_analysis_scripts.match_files_to_report_with_heuristics import match_bug_to_files
 from github_analysis_scripts.match_files_to_report_with_AI import VulnerabilityFileMatcher
+from code_context_scripts.analyze_valid_code_snippets import VulnerabilityAnalyzer
+from code_context_scripts.github_retrieve_code_context import GitHubCodeAnalyzer
 import requests
 import time
 from urllib.parse import urlparse, unquote
@@ -521,6 +524,12 @@ def analyze_relevant_files(json_file):
 
     validate_api_keys()
 
+    #Retrieve relevant code context from afflicted blobs to train AI
+    github_source_code_analyzer = GitHubCodeAnalyzer(GITHUB_API_KEY, OPENAI_API_KEY)
+
+    #Determine if broken/fixed code snippets have enough context to train AI
+    code_snippet_analyzer =  VulnerabilityAnalyzer(OPENAI_API_KEY, MODEL_NAME = "gpt-4.1-mini")
+
     # Get all relevant files AND the reports data from the JSON
     relevant_files_dict, reports = get_relevant_files(json_file)
         
@@ -535,13 +544,15 @@ def analyze_relevant_files(json_file):
 
         # ✅ Skip processing if afflicted_github_code_blob already exists and is non-empty
         if report.get("afflicted_github_code_blob"):
-            print(f"Report {report.get('id', i)} already has afflicted_github_code_blob, skipping..")
+            print(f"Report {report.get('id', i)} already has afflicted_github_code_blob, retrieving context")
+            report = github_source_code_analyzer.process_json_object(report)
             continue
 
         # ✅ Check if report has a source_code_url field
         source_code_url = report.get("source_code_url")
         afflicted_code_blobs = []
 
+        #If source code url is already in blob form
         if source_code_url:
             # Handle both string and list cases
             urls_to_check = source_code_url if isinstance(source_code_url, list) else [source_code_url]
@@ -556,12 +567,14 @@ def analyze_relevant_files(json_file):
                 print("Source code is already github blob, skipping..")
                 continue  # Skip the normal matching logic
 
-        # Process the individual report if no valid blob links found
+        # Process the individual report and get all github blobs
         matched_files = process_single_report(
             report, i, relevant_files_dict
         )
 
+        #If no github source blob, validate broken/fixed snippets to confirm usability/remove snippets that are no good
         if not matched_files:
+            report, _ = code_snippet_analyzer.process_json_object(report)
             continue
         
         report_title = report.get('title', f'Report_{i+1}')
@@ -580,6 +593,10 @@ def analyze_relevant_files(json_file):
         for match in all_matches[report_title]:
             afflicted_code_blobs.append(match.blob_url)
         report["afflicted_github_code_blob"] = afflicted_code_blobs
+
+        #If github source blob is generated, pull relevant context from broken/fixed sources
+        if report["afflicted_github_code_blob"]:
+            report = github_source_code_analyzer.process_json_object(report)
     
     # Save updated JSON
     save_updated_reports(json_file, reports)

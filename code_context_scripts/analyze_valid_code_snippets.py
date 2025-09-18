@@ -17,15 +17,21 @@ from openai import OpenAI
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')  # Set your OpenAI API key as environment variable
 MODEL_NAME = "gpt-4.1-mini"
-DELAY_BETWEEN_REQUESTS = 1  # seconds to avoid rate limiting
 
 class VulnerabilityAnalyzer:
-    def __init__(self, api_key: str = None):
+    def __init__(self, api_key: str = None, model_name: str = None):
         """Initialize the analyzer with OpenAI client."""
         if api_key:
             self.client = OpenAI(api_key=api_key)
         elif OPENAI_API_KEY:
             self.client = OpenAI(api_key=OPENAI_API_KEY)
+        else:
+            raise ValueError("OpenAI API key must be provided either as parameter or OPENAI_API_KEY environment variable")
+
+        if model_name:
+            self.model_name = model_name
+        elif MODEL_NAME:
+            self.model_name = MODEL_NAME
         else:
             raise ValueError("OpenAI API key must be provided either as parameter or OPENAI_API_KEY environment variable")
     
@@ -135,7 +141,7 @@ REASONING: [Your explanation]
             prompt = self.create_analysis_prompt(snippet, snippet_type, title, description, recommendation)
             
             response = self.client.chat.completions.create(
-                model=MODEL_NAME,
+                model=self.model_name,
                 messages=[
                     {"role": "user", "content": prompt}
                 ],
@@ -207,7 +213,7 @@ REASONING: [Your explanation]
                 status_icon = "✓" if analysis["assessment"] == "SUFFICIENT" else "✗" if analysis["assessment"] == "INSUFFICIENT" else "⚠"
                 print(f"      [{i+1}] {status_icon} {analysis['assessment']}: {analysis['reasoning']}")
                 
-                time.sleep(DELAY_BETWEEN_REQUESTS)
+                time.sleep(1)
             
             # Filter broken snippets
             original_count = len(snippets["broken"])
@@ -236,7 +242,7 @@ REASONING: [Your explanation]
                 status_icon = "✓" if analysis["assessment"] == "SUFFICIENT" else "✗" if analysis["assessment"] == "INSUFFICIENT" else "⚠"
                 print(f"      [{i+1}] {status_icon} {analysis['assessment']}: {analysis['reasoning']}")
                 
-                time.sleep(DELAY_BETWEEN_REQUESTS)
+                time.sleep(1)
             
             # Filter fixed snippets
             original_count = len(snippets["fixed"])
@@ -257,16 +263,15 @@ REASONING: [Your explanation]
         
         return processed_obj, analysis_results
     
-    def process_directory(self, directory: str, output_dir: str = None) -> Dict[str, Any]:
-        """Process all JSON files in directory and subdirectories, filtering code snippets."""
-        json_files = self.find_json_files(directory)
+    def process_single_file(self, file_path: str) -> Dict[str, Any]:
+        """Process a single JSON file, filtering code snippets and overwriting the original."""
+        file_path = Path(file_path)
         
-        if output_dir:
-            output_path = Path(output_dir)
-            output_path.mkdir(exist_ok=True)
-        else:
-            output_path = Path(directory) / "filtered"
-            output_path.mkdir(exist_ok=True)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        if not file_path.suffix.lower() == '.json':
+            raise ValueError(f"File must be a JSON file: {file_path}")
         
         summary_stats = {
             "files_processed": 0,
@@ -276,74 +281,101 @@ REASONING: [Your explanation]
             "analysis_results": []
         }
         
-        for file_path in json_files:
-            print(f"\nProcessing file: {file_path}")
-            json_objects = self.read_json_file(file_path)
+        print(f"\nProcessing file: {file_path}")
+        json_objects = self.read_json_file(file_path)
+        
+        if not json_objects:
+            print("No valid JSON objects found in file")
+            return summary_stats
+        
+        processed_objects = []
+        
+        for obj_index, json_obj in enumerate(json_objects):
+            print(f"  Object {obj_index + 1}:")
             
-            if not json_objects:
+            # Extract snippets for counting
+            snippets = self.extract_code_snippets(json_obj)
+            total_broken = len(snippets["broken"])
+            total_fixed = len(snippets["fixed"])
+            
+            if total_broken == 0 and total_fixed == 0:
+                print(f"    No code snippets found, keeping object unchanged")
+                processed_objects.append(json_obj)
                 continue
             
-            processed_objects = []
+            # Process the object
+            processed_obj, analysis_results = self.process_json_object(json_obj)
+            processed_objects.append(processed_obj)
             
-            for obj_index, json_obj in enumerate(json_objects):
-                print(f"  Object {obj_index + 1}:")
-                
-                # Extract snippets for counting
-                snippets = self.extract_code_snippets(json_obj)
-                total_broken = len(snippets["broken"])
-                total_fixed = len(snippets["fixed"])
-                
-                if total_broken == 0 and total_fixed == 0:
-                    print(f"    No code snippets found, keeping object unchanged")
-                    processed_objects.append(json_obj)
-                    continue
-                
-                # Process the object
-                processed_obj, analysis_results = self.process_json_object(json_obj)
-                processed_objects.append(processed_obj)
-                
-                # Update statistics
-                summary_stats["broken_snippets"]["total"] += total_broken
-                summary_stats["broken_snippets"]["removed"] += analysis_results["broken"]["removed_count"]
-                summary_stats["broken_snippets"]["kept"] += total_broken - analysis_results["broken"]["removed_count"]
-                
-                summary_stats["fixed_snippets"]["total"] += total_fixed
-                summary_stats["fixed_snippets"]["removed"] += analysis_results["fixed"]["removed_count"]
-                summary_stats["fixed_snippets"]["kept"] += total_fixed - analysis_results["fixed"]["removed_count"]
-                
-                # Print object summary
-                removed_broken = analysis_results["broken"]["removed_count"]
-                removed_fixed = analysis_results["fixed"]["removed_count"]
-                if removed_broken > 0 or removed_fixed > 0:
-                    print(f"    Removed: {removed_broken} broken, {removed_fixed} fixed snippet(s)")
+            # Update statistics
+            summary_stats["broken_snippets"]["total"] += total_broken
+            summary_stats["broken_snippets"]["removed"] += analysis_results["broken"]["removed_count"]
+            summary_stats["broken_snippets"]["kept"] += total_broken - analysis_results["broken"]["removed_count"]
+            
+            summary_stats["fixed_snippets"]["total"] += total_fixed
+            summary_stats["fixed_snippets"]["removed"] += analysis_results["fixed"]["removed_count"]
+            summary_stats["fixed_snippets"]["kept"] += total_fixed - analysis_results["fixed"]["removed_count"]
+            
+            # Print object summary
+            removed_broken = analysis_results["broken"]["removed_count"]
+            removed_fixed = analysis_results["fixed"]["removed_count"]
+            if removed_broken > 0 or removed_fixed > 0:
+                print(f"    Removed: {removed_broken} broken, {removed_fixed} fixed snippet(s)")
+            else:
+                print(f"    All snippets kept (sufficient context)")
+        
+        # Overwrite the original file
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                if len(processed_objects) == 1 and len(json_objects) == 1:
+                    # Single object file - maintain original structure
+                    json.dump(processed_objects[0], f, indent=2, ensure_ascii=False)
                 else:
-                    print(f"    All snippets kept (sufficient context)")
+                    # Array file - maintain array structure
+                    json.dump(processed_objects, f, indent=2, ensure_ascii=False)
             
-            # Save processed file
-            # Calculate relative path to maintain directory structure
-            base_path = Path(directory)
-            relative_path = file_path.relative_to(base_path)
-            output_file = output_path / relative_path
+            print(f"  Updated original file: {file_path}")
+            summary_stats["files_processed"] = 1
+            summary_stats["objects_processed"] = len(processed_objects)
+            
+        except Exception as e:
+            print(f"  Error saving file {file_path}: {e}")
+        
+        return summary_stats
 
-            # Create subdirectories if they don't exist
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-
-            # Save processed file
+    def process_directory(self, directory: str) -> Dict[str, Any]:
+        """Process all JSON files in directory and subdirectories, filtering code snippets."""
+        json_files = self.find_json_files(directory)
+        
+        summary_stats = {
+            "files_processed": 0,
+            "objects_processed": 0,
+            "broken_snippets": {"total": 0, "removed": 0, "kept": 0},
+            "fixed_snippets": {"total": 0, "removed": 0, "kept": 0},
+            "analysis_results": []
+        }
+        
+        
+        for file_path in json_files:
             try:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    if len(processed_objects) == 1 and len(json_objects) == 1:
-                        # Single object file - maintain original structure
-                        json.dump(processed_objects[0], f, indent=2, ensure_ascii=False)
-                    else:
-                        # Array file - maintain array structure
-                        json.dump(processed_objects, f, indent=2, ensure_ascii=False)
+                 
+                # Process single file using the dedicated function
+                file_stats = self.process_file(str(file_path))
                 
-                print(f"  Saved filtered file: {output_file}")
-                summary_stats["files_processed"] += 1
-                summary_stats["objects_processed"] += len(processed_objects)
+                # Aggregate statistics
+                summary_stats["files_processed"] += file_stats["files_processed"]
+                summary_stats["objects_processed"] += file_stats["objects_processed"]
+                
+                summary_stats["broken_snippets"]["total"] += file_stats["broken_snippets"]["total"]
+                summary_stats["broken_snippets"]["removed"] += file_stats["broken_snippets"]["removed"]
+                summary_stats["broken_snippets"]["kept"] += file_stats["broken_snippets"]["kept"]
+                
+                summary_stats["fixed_snippets"]["total"] += file_stats["fixed_snippets"]["total"]
+                summary_stats["fixed_snippets"]["removed"] += file_stats["fixed_snippets"]["removed"]
+                summary_stats["fixed_snippets"]["kept"] += file_stats["fixed_snippets"]["kept"]
                 
             except Exception as e:
-                print(f"  Error saving file {output_file}: {e}")
+                print(f"Error processing file {file_path}: {e}")
         
         return summary_stats
     
@@ -402,34 +434,28 @@ REASONING: [Your explanation]
 def main():
     """Main function to run the analyzer."""
     if len(sys.argv) < 2:
-        print("Usage: python vulnerability_filter.py <input_directory> [output_directory]")
-        print("Example: python vulnerability_filter.py ./vulnerability_reports ./filtered_reports")
+        print("Usage: python vulnerability_filter.py <input_directory>")
+        print("Example: python vulnerability_filter.py ./vulnerability_reports ")
         print("\nThis script will:")
         print("- Analyze broken_code_snippets and fixed_code_snippets in JSON files")
         print("- Remove snippets that lack sufficient context (marked as INSUFFICIENT)")
         print("- Preserve all other JSON fields unchanged")
-        print("- Save filtered files to output directory")
+        print("- Save filtered files over the original")
         print("\nMake sure to set your OpenAI API key:")
         print("export OPENAI_API_KEY='your-api-key-here'")
         sys.exit(1)
     
     input_directory = sys.argv[1]
-    output_directory = sys.argv[2] if len(sys.argv) > 2 else None
     
     try:
         print("Initializing Vulnerability Analyzer...")
         analyzer = VulnerabilityAnalyzer()
         
         print(f"Processing directory: {input_directory}")
-        if output_directory:
-            print(f"Output directory: {output_directory}")
-        else:
-            print(f"Output directory: {input_directory}/filtered")
         
-        stats = analyzer.process_directory(input_directory, output_directory)
+        stats = analyzer.process_directory(input_directory)
         
-        output_path = Path(output_directory) if output_directory else Path(input_directory) / "filtered"
-        analyzer.print_summary(stats, output_path)
+        analyzer.print_summary(stats, input_directory)
         
         print(f"\n✓ Processing complete! Check the output directory for filtered files.")
         
