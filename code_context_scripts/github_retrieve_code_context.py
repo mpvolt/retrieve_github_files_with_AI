@@ -157,173 +157,245 @@ Return ONLY the relevant code with context, no additional explanation or markdow
         
         logger.info(f"Processing object with afflicted_github_code_blob: {json_obj.get('title', 'Unknown')}")
         
+        try:
+            # Process afflicted code blobs
+            file_contexts = self._process_afflicted_blobs(json_obj)
+            
+            # Process fix commits if they exist
+            if 'fix_commit_url' in json_obj:
+                self._process_fix_commits(json_obj, file_contexts)
+            
+            # Add file contexts to the main object
+            self._add_file_contexts_to_object(updated_obj, file_contexts)
+            
+        except Exception as e:
+            logger.error(f"Error processing JSON object: {e}")
+            updated_obj['processing_error'] = str(e)
+        
+        return updated_obj
+
+    def _process_afflicted_blobs(self, json_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """Process all afflicted GitHub code blobs and return file contexts."""
         afflicted_blobs = json_obj['afflicted_github_code_blob']
         
         # Ensure afflicted_blobs is a list
         if not isinstance(afflicted_blobs, list):
             afflicted_blobs = [afflicted_blobs]
         
-        # Dictionary to store results organized by filename
         file_contexts = {}
         
-        try:
-            # Extract relevant fields for GPT analysis (used for all files)
-            title = json_obj.get('title', '')
-            description = json_obj.get('description', '')
-            recommendation = json_obj.get('recommendation', '')
-            broken_code_snippets = json_obj.get('broken_code_snippets', [])
-            
-            # Process each GitHub blob URL
-            for i, blob_url in enumerate(afflicted_blobs):
-                try:
-                    logger.info(f"Processing afflicted GitHub blob {i+1}/{len(afflicted_blobs)}: {blob_url}")
-                    
-                    # Parse GitHub URL and get code content
-                    github_info = self.parse_github_url(blob_url)
-                    code_content = self.get_file_content(
-                        github_info['owner'], 
-                        github_info['repo'], 
-                        github_info['path'], 
-                        github_info['ref']
-                    )
-                    
-                    # Extract filename from path
-                    filename = github_info['path'].split('/')[-1]
-                    
-                    # Analyze code with GPT
-                    vuln_context = self.analyze_code_with_gpt(
-                        code_content, title, description, recommendation, broken_code_snippets
-                    )
-                    
-                    # Initialize file context dictionary
-                    file_contexts[filename] = {
-                        'full_source_code': code_content.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'),
-                        'vulnerable_code': vuln_context.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') if isinstance(vuln_context, str) else vuln_context
-                    }
-                    
-                    logger.info(f"Added context for file: {filename}")
-                    
-                except Exception as e:
-                    logger.error(f"Error processing afflicted blob {blob_url}: {e}")
-                    # Still add an entry for this file with error info
-                    filename = blob_url.split('/')[-1] if '/' in blob_url else f"error_file_{i}"
-                    file_contexts[filename] = {
-                        'processing_error': str(e)
-                    }
-            
-        except Exception as e:
-            logger.error(f"Error processing afflicted_github_code_blob: {e}")
-            updated_obj['processing_error'] = str(e)
+        # Extract relevant fields for GPT analysis
+        title = json_obj.get('title', '')
+        description = json_obj.get('description', '')
+        recommendation = json_obj.get('recommendation', '')
+        broken_code_snippets = json_obj.get('broken_code_snippets', [])
         
-        # Check if object also contains fix_commit_url
-        if 'fix_commit_url' in json_obj:
-            logger.info(f"Processing fix_commit_url: {json_obj['fix_commit_url']}")
-            
+        for i, blob_url in enumerate(afflicted_blobs):
             try:
-                # Handle both string and array formats for fix_commit_url
-                fix_commit = json_obj['fix_commit_url']
+                logger.info(f"Processing afflicted GitHub blob {i+1}/{len(afflicted_blobs)}: {blob_url}")
                 
-                if isinstance(fix_commit, list):
-                    if len(fix_commit) == 0:
-                        logger.warning("fix_commit_url is empty array, skipping fix processing")
-                    else:
-                        logger.info(f"Processing {len(fix_commit)} fix commit URLs")
-                        commit_urls = fix_commit
-                else:
-                    commit_urls = [fix_commit]
+                file_context = self._process_single_afflicted_blob(
+                    blob_url, title, description, recommendation, broken_code_snippets
+                )
                 
-                # Process each commit URL and update file contexts with fixed code
-                for commit_i, commit_url in enumerate(commit_urls):
-                    try:
-                        logger.info(f"Processing fix commit {commit_i+1}/{len(commit_urls)}: {commit_url}")
-                        
-                        # Parse commit URL
-                        commit_info = self.parse_commit_url(commit_url)
-                        
-                        # For each file that was processed in the afflicted blobs
-                        for filename, file_context in file_contexts.items():
-                            if 'processing_error' in file_context:
-                                continue  # Skip files that had processing errors
-                            
-                            try:
-                                # Find the corresponding github_info for this file
-                                original_github_info = None
-                                
-                                for blob_url in afflicted_blobs:
-                                    try:
-                                        temp_github_info = self.parse_github_url(blob_url)
-                                        temp_filename = temp_github_info['path'].split('/')[-1]
-                                        if temp_filename == filename:
-                                            original_github_info = temp_github_info
-                                            break
-                                    except:
-                                        continue
-                                
-                                if original_github_info is None:
-                                    logger.warning(f"Could not find original GitHub info for file: {filename}")
-                                    continue
-                                
-                                # Get the updated file content using the commit SHA
-                                updated_code_content = self.get_file_content(
-                                    commit_info['owner'],
-                                    commit_info['repo'],
-                                    original_github_info['path'],
-                                    commit_info['sha']
-                                )
-                                
-                                # Analyze updated code with GPT
-                                updated_context = self.analyze_code_with_gpt(
-                                    updated_code_content, title, description, recommendation, broken_code_snippets
-                                )
-                                
-                                # Add fixed code context to the file's dictionary (single line format)
-                                file_context['fixed_code'] = updated_context.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') if isinstance(updated_context, str) else updated_context
-                                file_context['full_fixed_source_code'] = updated_code_content.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-                                
-                            except Exception as e:
-                                logger.error(f"Error processing fix commit {commit_url} for file {filename}: {e}")
-                                file_context['fix_processing_error'] = str(e)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing fix commit {commit_url}: {e}")
-                        # Add error to all file contexts
-                        for file_context in file_contexts.values():
-                            if 'processing_error' not in file_context:
-                                file_context['fix_processing_error'] = str(e)
+                # Extract filename from the blob URL
+                github_info = self.parse_github_url(blob_url)
+                filename = github_info['path'].split('/')[-1]
                 
-                logger.info("Added fixed code to file contexts")
+                file_contexts[filename] = file_context
+                logger.info(f"Added context for file: {filename}")
                 
             except Exception as e:
-                logger.error(f"Error processing fix_commit_url: {e}")
-                updated_obj['fix_processing_error'] = str(e)
+                logger.error(f"Error processing afflicted blob {blob_url}: {e}")
+                filename = self._extract_filename_from_url(blob_url, i)
+                file_contexts[filename] = {'processing_error': str(e)}
         
-        # Create the nested file structure as requested
-        if file_contexts:
-            # If there's only one file, use it directly
-            if len(file_contexts) == 1:
-                filename, context = next(iter(file_contexts.items()))
-                updated_obj['file'] = {
-                    'name': filename,
-                    **context
-                }
-            else:
-                # If there are multiple files, you might want to handle this differently
-                # For now, we'll include all files in a list or choose the first one
-                # This assumes you want the primary file - you may need to adjust this logic
-                primary_filename, primary_context = next(iter(file_contexts.items()))
-                updated_obj['file'] = {
-                    'name': primary_filename,
-                    **primary_context
-                }
+        logger.info(f"Processed {len(file_contexts)} afflicted blobs")
+        return file_contexts
+
+    def _process_single_afflicted_blob(self, blob_url: str, title: str, description: str, 
+                                    recommendation: str, broken_code_snippets: list) -> Dict[str, Any]:
+        """Process a single afflicted GitHub blob and return its context."""
+        # Parse GitHub URL and get code content
+        github_info = self.parse_github_url(blob_url)
+        code_content = self.get_file_content(
+            github_info['owner'], 
+            github_info['repo'], 
+            github_info['path'], 
+            github_info['ref']
+        )
+        
+        # Analyze code with GPT
+        vulnerable_context = self.analyze_code_with_gpt(
+            code_content, title, description, recommendation, broken_code_snippets
+        )
+        
+        # Return nested structure
+        return {
+            'broken': {
+                'full_vulnerable_source_code': code_content,
+                'vulnerable_code_context': vulnerable_context
+            }
+        }
+
+    def _process_fix_commits(self, json_obj: Dict[str, Any], file_contexts: Dict[str, Any]) -> None:
+        """Process fix commit URLs and update file contexts with patched code."""
+        fix_commit = json_obj['fix_commit_url']
+        logger.info(f"Processing fix_commit_url: {fix_commit}")
+        
+        # Handle both string and array formats for fix_commit_url
+        commit_urls = self._normalize_commit_urls(fix_commit)
+        if not commit_urls:
+            return
+        
+        afflicted_blobs = json_obj['afflicted_github_code_blob']
+        if not isinstance(afflicted_blobs, list):
+            afflicted_blobs = [afflicted_blobs]
+        
+        # Extract fields for GPT analysis
+        title = json_obj.get('title', '')
+        description = json_obj.get('description', '')
+        recommendation = json_obj.get('recommendation', '')
+        broken_code_snippets = json_obj.get('broken_code_snippets', [])
+        
+        # Process each commit URL
+        for commit_i, commit_url in enumerate(commit_urls):
+            try:
+                logger.info(f"Processing fix commit {commit_i+1}/{len(commit_urls)}: {commit_url}")
+                self._process_single_fix_commit(
+                    commit_url, file_contexts, afflicted_blobs, 
+                    title, description, recommendation, broken_code_snippets
+                )
+            except Exception as e:
+                logger.error(f"Error processing fix commit {commit_url}: {e}")
+                self._add_commit_error_to_all_files(file_contexts, commit_url, str(e))
+        
+        # Clean up single-item lists for better structure
+        self._cleanup_single_commit_lists(file_contexts)
+        logger.info("Added patched data to file contexts")
+
+    def _normalize_commit_urls(self, fix_commit) -> list:
+        """Normalize fix_commit_url to a list of URLs."""
+        if isinstance(fix_commit, list):
+            if len(fix_commit) == 0:
+                logger.warning("fix_commit_url is empty array, skipping fix processing")
+                return []
+            logger.info(f"Processing {len(fix_commit)} fix commit URLs")
+            return fix_commit
+        else:
+            return [fix_commit]
+
+    def _process_single_fix_commit(self, commit_url: str, file_contexts: Dict[str, Any], 
+                                afflicted_blobs: list, title: str, description: str, 
+                                recommendation: str, broken_code_snippets: list) -> None:
+        """Process a single fix commit and update file contexts."""
+        commit_info = self.parse_commit_url(commit_url)
+        
+        # Process each file that was in the afflicted blobs
+        for filename, file_context in file_contexts.items():
+            if 'processing_error' in file_context:
+                continue  # Skip files that had processing errors
+            
+            try:
+                # Find the original GitHub info for this file
+                original_github_info = self._find_original_github_info(filename, afflicted_blobs)
+                if original_github_info is None:
+                    logger.warning(f"Could not find original GitHub info for file: {filename}")
+                    continue
                 
-                # Optionally, you could include all files:
-                # updated_obj['files'] = [
-                #     {'name': fname, **ctx} for fname, ctx in file_contexts.items()
-                # ]
+                # Get and analyze the fixed code
+                patched_data = self._get_and_analyze_patched_code(
+                    commit_info, original_github_info, title, description, recommendation, broken_code_snippets
+                )
+                
+                # Add to file context
+                self._add_patched_data_to_file_context(file_context, commit_url, commit_info['sha'], patched_data)
+                
+            except Exception as e:
+                logger.error(f"Error processing fix commit {commit_url} for file {filename}: {e}")
+                self._add_patched_error_to_file_context(file_context, commit_url, str(e))
+
+    def _find_original_github_info(self, filename: str, afflicted_blobs: list) -> Dict[str, Any]:
+        """Find the original GitHub info for a given filename."""
+        for blob_url in afflicted_blobs:
+            try:
+                github_info = self.parse_github_url(blob_url)
+                if github_info['path'].split('/')[-1] == filename:
+                    return github_info
+            except:
+                continue
+        return None
+
+    def _get_and_analyze_patched_code(self, commit_info: Dict[str, Any], original_github_info: Dict[str, Any],
+                                    title: str, description: str, recommendation: str, 
+                                    broken_code_snippets: list) -> Dict[str, Any]:
+        """Get the patched code content and analyze it with GPT."""
+        # Get the updated file content using the commit SHA
+        updated_code_content = self.get_file_content(
+            commit_info['owner'],
+            commit_info['repo'],
+            original_github_info['path'],
+            commit_info['sha']
+        )
         
-        logger.info(f"Created file object with {len(file_contexts)} file contexts")
+        # Analyze updated code with GPT
+        patched_context = self.analyze_code_with_gpt(
+            updated_code_content, title, description, recommendation, broken_code_snippets
+        )
         
-        return updated_obj
+        return {
+            'full_patched_source_code': updated_code_content,
+            'patched_code_context': patched_context
+        }
+
+    def _add_patched_data_to_file_context(self, file_context: Dict[str, Any], commit_url: str, 
+                                        commit_sha: str, patched_data: Dict[str, Any]) -> None:
+        """Add patched data to a file context."""
+        if 'patched' not in file_context:
+            file_context['patched'] = []
+        
+        file_context['patched'].append({
+            'commit_url': commit_url,
+            'commit_sha': commit_sha,
+            **patched_data
+        })
+
+    def _add_patched_error_to_file_context(self, file_context: Dict[str, Any], commit_url: str, error: str) -> None:
+        """Add an error entry to a file context's patched data."""
+        if 'patched' not in file_context:
+            file_context['patched'] = []
+        
+        file_context['patched'].append({
+            'commit_url': commit_url,
+            'error': error
+        })
+
+    def _add_commit_error_to_all_files(self, file_contexts: Dict[str, Any], commit_url: str, error: str) -> None:
+        """Add a commit processing error to all file contexts."""
+        for file_context in file_contexts.values():
+            if 'processing_error' not in file_context:
+                self._add_patched_error_to_file_context(file_context, commit_url, error)
+
+    def _cleanup_single_commit_lists(self, file_contexts: Dict[str, Any]) -> None:
+        """Clean up single-item lists for better structure when there's only one commit."""
+        for file_context in file_contexts.values():
+            if 'patched' in file_context and len(file_context['patched']) == 1:
+                single_fix = file_context['patched'][0]
+                if 'error' not in single_fix:
+                    file_context['patched'] = {
+                        'patched_code_context': single_fix['patched_code_context'],
+                        'full_patched_source_code': single_fix['full_patched_source_code']
+                    }
+
+    def _extract_filename_from_url(self, blob_url: str, index: int) -> str:
+        """Extract filename from blob URL, with fallback for errors."""
+        return blob_url.split('/')[-1] if '/' in blob_url else f"error_file_{index}"
+
+    def _add_file_contexts_to_object(self, updated_obj: Dict[str, Any], file_contexts: Dict[str, Any]) -> None:
+        """Add file contexts directly to the updated object with filename keys."""
+        for filename, context in file_contexts.items():
+            updated_obj[filename] = context
+        logger.info(f"Added contexts for {len(file_contexts)} files")
 
     def process_single_json_file(self, file_path: str) -> None:
         """Process a single JSON file."""

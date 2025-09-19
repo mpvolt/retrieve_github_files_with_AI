@@ -449,7 +449,7 @@ def process_single_report(report, i, relevant_files_dict):
     print(f"Found {len(relevant_files)} relevant files")
 
     #Run heuristics matching to determine relevant files before processing with AI
-    heuristics_processed_files = run_heuristics_matching(report, relevant_files)
+    #heuristics_processed_files = run_heuristics_matching(report, relevant_files)
     print(heuristics_processed_files)
     print(f"Heuristics Matching returned {len(heuristics_processed_files)}, now using GPT4.1")
 
