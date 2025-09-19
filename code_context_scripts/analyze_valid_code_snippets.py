@@ -360,7 +360,7 @@ REASONING: [Your explanation]
             try:
                  
                 # Process single file using the dedicated function
-                file_stats = self.process_file(str(file_path))
+                file_stats = self.process_single_file(str(file_path))
                 
                 # Aggregate statistics
                 summary_stats["files_processed"] += file_stats["files_processed"]

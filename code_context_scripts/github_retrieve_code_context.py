@@ -17,8 +17,6 @@ import base64
 import argparse
 import logging
 
-from main import process_single_json_file
-
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -199,8 +197,8 @@ Return ONLY the relevant code with context, no additional explanation or markdow
                     
                     # Initialize file context dictionary
                     file_contexts[filename] = {
-                        'full_source_code': code_content,
-                        'vulnerable_code': vuln_context
+                        'full_source_code': code_content.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'),
+                        'vulnerable_code': vuln_context.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') if isinstance(vuln_context, str) else vuln_context
                     }
                     
                     logger.info(f"Added context for file: {filename}")
@@ -249,8 +247,6 @@ Return ONLY the relevant code with context, no additional explanation or markdow
                             
                             try:
                                 # Find the corresponding github_info for this file
-                                # We need to reconstruct the path from the original afflicted blobs
-                                original_blob_url = None
                                 original_github_info = None
                                 
                                 for blob_url in afflicted_blobs:
@@ -280,59 +276,56 @@ Return ONLY the relevant code with context, no additional explanation or markdow
                                     updated_code_content, title, description, recommendation, broken_code_snippets
                                 )
                                 
-                                # Add fixed code context to the file's dictionary
-                                if 'patched_code' not in file_context:
-                                    file_context['patched_code'] = []
-                                
-                                file_context['patched_code'].append({
-                                    'fixed_code_context': updated_context,
-                                    'full_fixed_source_code': updated_code_content
-                                })
+                                # Add fixed code context to the file's dictionary (single line format)
+                                file_context['fixed_code'] = updated_context.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t') if isinstance(updated_context, str) else updated_context
+                                file_context['full_fixed_source_code'] = updated_code_content.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                                 
                             except Exception as e:
                                 logger.error(f"Error processing fix commit {commit_url} for file {filename}: {e}")
-                                if 'patched_code' not in file_context:
-                                    file_context['patched_code'] = []
-                                
-                                file_context['patched_code'].append({
-                                    'commit_url': commit_url,
-                                    'error': str(e)
-                                })
+                                file_context['fix_processing_error'] = str(e)
                         
                     except Exception as e:
                         logger.error(f"Error processing fix commit {commit_url}: {e}")
                         # Add error to all file contexts
                         for file_context in file_contexts.values():
                             if 'processing_error' not in file_context:
-                                if 'patched_code' not in file_context:
-                                    file_context['patched_code'] = []
-                                file_context['patched_code'].append({
-                                    'commit_url': commit_url,
-                                    'error': str(e)
-                                })
+                                file_context['fix_processing_error'] = str(e)
                 
-                # Clean up single-item lists for backward compatibility
-                for file_context in file_contexts.values():
-                    if 'patched_code' in file_context and len(file_context['patched_code']) == 1:
-                        single_fix = file_context['patched_code'][0]
-                        if 'error' not in single_fix:
-                            file_context['patched_code'] = single_fix['fixed_code_context']
-                            file_context['full_fixed_source_code'] = single_fix['full_fixed_source_code']
-                
-                logger.info("Added patched_code to file contexts")
+                logger.info("Added fixed code to file contexts")
                 
             except Exception as e:
                 logger.error(f"Error processing fix_commit_url: {e}")
                 updated_obj['fix_processing_error'] = str(e)
         
-        # Store the file contexts directly under filename keys (flattened)
-        for filename, context in file_contexts.items():
-            updated_obj[filename] = context
-        logger.info(f"Added contexts for {len(file_contexts)} files")
-
+        # Create the nested file structure as requested
+        if file_contexts:
+            # If there's only one file, use it directly
+            if len(file_contexts) == 1:
+                filename, context = next(iter(file_contexts.items()))
+                updated_obj['file'] = {
+                    'name': filename,
+                    **context
+                }
+            else:
+                # If there are multiple files, you might want to handle this differently
+                # For now, we'll include all files in a list or choose the first one
+                # This assumes you want the primary file - you may need to adjust this logic
+                primary_filename, primary_context = next(iter(file_contexts.items()))
+                updated_obj['file'] = {
+                    'name': primary_filename,
+                    **primary_context
+                }
+                
+                # Optionally, you could include all files:
+                # updated_obj['files'] = [
+                #     {'name': fname, **ctx} for fname, ctx in file_contexts.items()
+                # ]
+        
+        logger.info(f"Created file object with {len(file_contexts)} file contexts")
+        
         return updated_obj
 
-    def process_single_file(self, file_path: str) -> None:
+    def process_single_json_file(self, file_path: str) -> None:
         """Process a single JSON file."""
         json_file = Path(file_path)
         
@@ -386,7 +379,7 @@ Return ONLY the relevant code with context, no additional explanation or markdow
         logger.info(f"Found {len(json_files)} JSON files")
         
         for json_file in json_files:
-            process_single_json_file(json_file)
+            self.process_single_json_file(json_file)
 
 
 def main():

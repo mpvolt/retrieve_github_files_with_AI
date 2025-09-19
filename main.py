@@ -3,6 +3,7 @@ from github_analysis_scripts.analyze_relevant_files import analyze_relevant_file
 import os
 import json
 import time
+import sys
 import requests
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -152,7 +153,10 @@ def process_json_files_with_rate_limiting_parallel():
     if not api_key:
         raise ValueError("GITHUB_API_KEY environment variable is not set")
 
-    input_dir = "/mnt/d/golden_dataset"
+    # Use first command-line argument as input_dir if provided, otherwise default
+    input_dir = sys.argv[1] if len(sys.argv) > 1 else "/mnt/d/golden_dataset"
+
+    print(f"Processing JSON files in directory: {input_dir}")
 
     #Rate manager to manage rate limits
     rate_manager = GitHubRateLimitManager(api_key, min_requests_threshold=50)

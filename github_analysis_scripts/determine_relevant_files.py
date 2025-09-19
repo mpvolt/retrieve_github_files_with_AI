@@ -289,7 +289,7 @@ def normalize_to_commit(owner: str, repo: str, url: str, headers: dict) -> str:
     raise ValueError("Unsupported GitHub URL type")
 
 
-def find_file_before_change(commit_url: str, blob_url: str, max_commits: int = 30, debug: bool = False) -> str | None:
+def find_file_before_change(commit_url: str, blob_url: str, max_commits: int = 30, debug: bool = False) -> str:
     """
     Given a GitHub commit/tree/compare URL and a blob URL, finds where in the commit history
     that file was changed and returns a blob link to the original version before the change.
