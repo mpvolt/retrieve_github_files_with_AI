@@ -10,6 +10,8 @@ from typing import Optional, Dict, Any
 import logging
 import concurrent.futures
 import threading
+from code_context_scripts.analyze_valid_code_snippets import VulnerabilityAnalyzer
+from code_context_scripts.github_retrieve_code_context import GitHubCodeAnalyzer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -124,6 +126,14 @@ def process_single_json_file(json_file_str: str, rate_manager, max_retries=3):
 
                 #Convert github source/fix links into github blobs
                 success = analyze_relevant_files(json_file_str)
+
+                #Retrieve relevant code context from github blobs to train AI
+                github_source_code_analyzer = GitHubCodeAnalyzer(GITHUB_API_KEY, OPENAI_API_KEY)
+                github_source_code_analyzer.process_single_json_file(json_file_str)
+
+                #Determine if broken/fixed code snippets have enough context to train AI
+                code_snippet_analyzer = VulnerabilityAnalyzer(OPENAI_API_KEY, "gpt-4.1-mini")
+                code_snippet_analyzer.process_single_file(json_file_str)
 
                 if success is not None:
                     logger.info(f"Successfully processed {json_file_str}")

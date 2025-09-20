@@ -392,9 +392,20 @@ Return ONLY the relevant code with context, no additional explanation or markdow
         return blob_url.split('/')[-1] if '/' in blob_url else f"error_file_{index}"
 
     def _add_file_contexts_to_object(self, updated_obj: Dict[str, Any], file_contexts: Dict[str, Any]) -> None:
-        """Add file contexts directly to the updated object with filename keys."""
+        """
+        Transform file_contexts into a list of code diffs with 'filename', 'broken', and 'patched' keys.
+        """
+        code_diffs = []
         for filename, context in file_contexts.items():
-            updated_obj[filename] = context
+            # context already contains keys like 'broken' (and possibly 'patched')
+            entry = {
+                "filename": filename,
+                "broken": context.get("broken", {}),
+                "patched": context.get("patched", {})
+            }
+            code_diffs.append(entry)
+
+        updated_obj["code_diff"] = code_diffs
         logger.info(f"Added contexts for {len(file_contexts)} files")
 
     def process_single_json_file(self, file_path: str) -> None:

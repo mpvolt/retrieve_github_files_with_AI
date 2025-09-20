@@ -9,8 +9,6 @@ from github_analysis_scripts.determine_relevant_files import get_relevant_files,
 from github_file_retrieval_scripts.retrieve_all_smart_contract_functions import extract_function_names
 from github_analysis_scripts.match_files_to_report_with_heuristics import match_bug_to_files
 from github_analysis_scripts.match_files_to_report_with_AI import VulnerabilityFileMatcher
-from code_context_scripts.analyze_valid_code_snippets import VulnerabilityAnalyzer
-from code_context_scripts.github_retrieve_code_context import GitHubCodeAnalyzer
 import requests
 import time
 from urllib.parse import urlparse, unquote
@@ -449,7 +447,7 @@ def process_single_report(report, i, relevant_files_dict):
     print(f"Found {len(relevant_files)} relevant files")
 
     #Run heuristics matching to determine relevant files before processing with AI
-    #heuristics_processed_files = run_heuristics_matching(report, relevant_files)
+    heuristics_processed_files = run_heuristics_matching(report, relevant_files)
     print(heuristics_processed_files)
     print(f"Heuristics Matching returned {len(heuristics_processed_files)}, now using GPT4.1")
 
@@ -524,12 +522,6 @@ def analyze_relevant_files(json_file):
 
     validate_api_keys()
 
-    #Retrieve relevant code context from afflicted blobs to train AI
-    github_source_code_analyzer = GitHubCodeAnalyzer(GITHUB_API_KEY, OPENAI_API_KEY)
-
-    #Determine if broken/fixed code snippets have enough context to train AI
-    code_snippet_analyzer =  VulnerabilityAnalyzer(OPENAI_API_KEY, "gpt-4.1-mini")
-
     # Get all relevant files AND the reports data from the JSON
     relevant_files_dict, reports = get_relevant_files(json_file)
         
@@ -545,7 +537,6 @@ def analyze_relevant_files(json_file):
         # ✅ Just get code context if afflicted_github_code_blob already exists and is non-empty
         if report.get("afflicted_github_code_blob"):
             print(f"Report {report.get('id', i)} already has afflicted_github_code_blob, retrieving context")
-            report = github_source_code_analyzer.process_json_object(report)
             continue
 
         # ✅ Check if report has a source_code_url field
@@ -565,9 +556,6 @@ def analyze_relevant_files(json_file):
                 # Assign afflicted_github_code_blob and skip normal processing
                 report["afflicted_github_code_blob"] = afflicted_code_blobs
                 print("Source code is already github blob")
-                
-                #Get context from blob files
-                report = github_source_code_analyzer.process_json_object(report)
                 continue  # Skip the normal matching logic
 
         # Process the individual report and get all github blobs
@@ -577,8 +565,6 @@ def analyze_relevant_files(json_file):
 
         #If no github source blob
         if not matched_files:
-            #Validate just the broken/fixed snippet fields if they exist
-            report, _ = code_snippet_analyzer.process_json_object(report)
             continue
         
         report_title = report.get('title', f'Report_{i+1}')
@@ -597,10 +583,6 @@ def analyze_relevant_files(json_file):
         for match in all_matches[report_title]:
             afflicted_code_blobs.append(match.blob_url)
         report["afflicted_github_code_blob"] = afflicted_code_blobs
-
-        #If github source blob is generated, pull relevant context from blob sources
-        if report["afflicted_github_code_blob"]:
-            report = github_source_code_analyzer.process_json_object(report)
     
     # Save updated JSON
     save_updated_reports(json_file, reports)
