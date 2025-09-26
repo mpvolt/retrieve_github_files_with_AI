@@ -5,7 +5,7 @@ const Parser = require('@solidity-parser/parser');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const DependencyResolver = require('./dependency_resolver.js');
+const DependencyResolver = require('./dependency-resolver.js');
 
 class GitHubSolidityAnalyzer {
   constructor() {
@@ -508,6 +508,8 @@ Usage: node solidity-analyzer.js <github-blob-url> [output-file] [options]
 Options:
   --no-deps          Disable dependency resolution
   --max-depth=N      Maximum recursion depth for dependencies (default: 3)
+  --no-common-libs   Skip resolving common libraries (OpenZeppelin, Solady, etc.)
+  --libs-only        Only resolve common libraries, skip local dependencies
 
 Examples:
   # Analyze single file with dependency resolution
@@ -519,6 +521,12 @@ Examples:
   # Analyze with custom depth and output
   node solidity-analyzer.js https://github.com/owner/repo/blob/main/Contract.sol output.json --max-depth=2
 
+  # Skip common libraries (faster, local deps only)
+  node solidity-analyzer.js https://github.com/owner/repo/blob/main/Contract.sol --no-common-libs
+
+  # Only resolve common libraries (security analysis focus)
+  node solidity-analyzer.js https://github.com/owner/repo/blob/main/Contract.sol --libs-only
+
   # Analyze multiple files
   node solidity-analyzer.js "url1,url2,url3" analysis.json
 `);
@@ -529,6 +537,8 @@ Examples:
   let outputFile = 'solidity-analysis.json';
   let resolveDependencies = true;
   let maxDepth = 3;
+  let resolveCommonLibs = true;
+  let libsOnly = false;
   
   // Parse arguments
   for (let i = 1; i < args.length; i++) {
@@ -537,6 +547,10 @@ Examples:
       resolveDependencies = false;
     } else if (arg.startsWith('--max-depth=')) {
       maxDepth = parseInt(arg.split('=')[1]) || 3;
+    } else if (arg === '--no-common-libs') {
+      resolveCommonLibs = false;
+    } else if (arg === '--libs-only') {
+      libsOnly = true;
     } else if (!arg.startsWith('--')) {
       outputFile = arg;
     }
@@ -544,6 +558,15 @@ Examples:
   
   try {
     const analyzer = new GitHubSolidityAnalyzer();
+    
+    // Configure dependency resolver
+    if (!resolveCommonLibs) {
+      analyzer.dependencyResolver.resolveCommonLibraries = false;
+    }
+    if (libsOnly) {
+      analyzer.dependencyResolver.libsOnly = true;
+    }
+    
     let report;
 
     // Check if multiple URLs (comma-separated)
@@ -574,10 +597,14 @@ Examples:
     
     if (report.dependencies.failed.length > 0) {
       console.log('\n=== Failed Dependencies ===');
-      console.log('External (expected to fail):');
-      report.dependencies.external.forEach(dep => console.log(`  🌐 ${dep}`));
-      console.log('Unreachable (unexpected failures):');
-      report.dependencies.unreachable.forEach(dep => console.log(`  ❌ ${dep}`));
+      if (report.dependencies.external.length > 0) {
+        console.log('External (expected to fail):');
+        report.dependencies.external.forEach(dep => console.log(`  🌐 ${dep}`));
+      }
+      if (report.dependencies.unreachable.length > 0) {
+        console.log('Unreachable (try --libs-only to resolve common libraries):');
+        report.dependencies.unreachable.forEach(dep => console.log(`  ❌ ${dep}`));
+      }
     }
     
   } catch (error) {

@@ -7,6 +7,12 @@ class DependencyResolver {
     this.processedDependencies = new Set(); // Track processed dependencies to avoid duplicates
     this.failedDependencies = new Set(); // Track dependencies that couldn't be resolved
     this.resolvedFiles = new Map(); // dependency path -> file data
+    
+    // Bind methods to ensure proper context
+    this.isExternalDependency = this.isExternalDependency.bind(this);
+    this.resolveDependencyPaths = this.resolveDependencyPaths.bind(this);
+    this.tryFetchDependency = this.tryFetchDependency.bind(this);
+    this.resolveDependencies = this.resolveDependencies.bind(this);
   }
 
   // Parse repository information from GitHub URL
@@ -98,6 +104,163 @@ class DependencyResolver {
     }
   }
 
+  // Check if dependency is external (can't be resolved in same repo)
+  isExternalDependency(dependencyPath) {
+    // Avoid circular reference - check patterns directly first
+    const externalPatterns = [
+      /^@openzeppelin\//, // OpenZeppelin packages (npm style)
+      /^@chainlink\//, // Chainlink packages
+      /^hardhat\//, // Hardhat imports
+      /^node_modules\//, // Node modules
+      /^npm:/, // NPM packages
+      /^https?:\/\//, // HTTP URLs
+      /^ipfs:\/\//, // IPFS URLs
+    ];
+    
+    // If it matches known external patterns, check if we can resolve it through common libraries
+    const isExternalPattern = externalPatterns.some(pattern => pattern.test(dependencyPath));
+    if (isExternalPattern) {
+      return true; // These are truly external
+    }
+    
+    // For other patterns, check if we can resolve them through common libraries
+    const commonLibraryUrls = this.tryResolveCommonLibrariesSafe(dependencyPath);
+    if (commonLibraryUrls.length > 0) {
+      return false; // We can resolve it, so it's not truly "external"
+    }
+    
+    return false; // Default to treating as local dependency
+  }
+
+  // Safe version of tryResolveCommonLibraries that doesn't call isExternalDependency
+  tryResolveCommonLibrariesSafe(dependencyPath) {
+    const commonLibraries = {
+      // Solady library
+      'solady/': 'https://github.com/Vectorized/solady/blob/main/',
+      
+      // OpenZeppelin (if not already handled)
+      'openzeppelin-contracts/': 'https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/',
+      
+      // Solmate library
+      'solmate/': 'https://github.com/transmissions11/solmate/blob/main/',
+      
+      // Foundry standard library
+      'forge-std/': 'https://github.com/foundry-rs/forge-std/blob/master/',
+      
+      // Chainlink contracts
+      'chainlink/': 'https://github.com/smartcontractkit/chainlink/blob/develop/',
+      
+      // Uniswap contracts
+      'uniswap/': 'https://github.com/Uniswap/v3-core/blob/main/',
+    };
+    
+    // Check if dependency matches any common library pattern
+    for (const [prefix, baseUrl] of Object.entries(commonLibraries)) {
+      if (dependencyPath.startsWith(prefix)) {
+        if (baseUrl) {
+          // Direct mapping to known repository
+          const relativePath = dependencyPath.substring(prefix.length);
+          const fullUrl = `${baseUrl}${relativePath}`;
+          
+          // Convert to GitHub blob URL format
+          const blobUrl = this.convertRawToGitHubUrl(fullUrl);
+          return [blobUrl];
+        } else {
+          // Try multiple common repositories
+          return this.tryMultipleCommonRepos(dependencyPath);
+        }
+      }
+    }
+    
+    // Check for specific well-known contracts by name
+    const wellKnownContracts = this.resolveWellKnownContracts(dependencyPath);
+    if (wellKnownContracts.length > 0) {
+      return wellKnownContracts;
+    }
+    
+    return [];
+  }
+
+  // Try to resolve common Solidity libraries
+  tryResolveCommonLibraries(dependencyPath) {
+    return this.tryResolveCommonLibrariesSafe(dependencyPath);
+  }
+
+  // Convert raw GitHub URL to blob URL
+  convertRawToGitHubUrl(rawUrl) {
+    try {
+      // Convert raw.githubusercontent.com URL back to github.com blob URL
+      if (rawUrl.includes('raw.githubusercontent.com')) {
+        const url = new URL(rawUrl);
+        const pathParts = url.pathname.split('/');
+        // Format: /owner/repo/branch/path...
+        if (pathParts.length >= 4) {
+          const owner = pathParts[1];
+          const repo = pathParts[2];
+          const branch = pathParts[3];
+          const filePath = pathParts.slice(4).join('/');
+          return `https://github.com/${owner}/${repo}/blob/${branch}/${filePath}`;
+        }
+      }
+      
+      // If it's already a blob URL or other format, return as is
+      return rawUrl;
+    } catch {
+      return rawUrl;
+    }
+  }
+
+  // Try multiple common repositories for generic paths
+  tryMultipleCommonRepos(dependencyPath) {
+    const commonRepos = [
+      'https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/',
+      'https://github.com/Vectorized/solady/blob/main/',
+      'https://github.com/transmissions11/solmate/blob/main/',
+      'https://github.com/foundry-rs/forge-std/blob/master/'
+    ];
+    
+    return commonRepos.map(baseUrl => {
+      // Try both with and without 'src' prefix for libraries like solady
+      const urls = [
+        `${baseUrl}${dependencyPath}`,
+        `${baseUrl}src/${dependencyPath}`,
+        `${baseUrl}contracts/${dependencyPath}`
+      ];
+      
+      return urls;
+    }).flat();
+  }
+
+  // Resolve well-known contract names to their canonical locations
+  resolveWellKnownContracts(dependencyPath) {
+    const fileName = dependencyPath.split('/').pop();
+    
+    const wellKnownContracts = {
+      'Ownable.sol': [
+        'https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/access/Ownable.sol',
+        'https://github.com/Vectorized/solady/blob/main/src/auth/Ownable.sol'
+      ],
+      'ERC20.sol': [
+        'https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/ERC20.sol',
+        'https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol'
+      ],
+      'ERC721.sol': [
+        'https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC721/ERC721.sol',
+        'https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC721.sol'
+      ],
+      'ReentrancyGuard.sol': [
+        'https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/ReentrancyGuard.sol',
+        'https://github.com/transmissions11/solmate/blob/main/src/utils/ReentrancyGuard.sol'
+      ],
+      'SafeTransferLib.sol': [
+        'https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol',
+        'https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol'
+      ]
+    };
+    
+    return wellKnownContracts[fileName] || [];
+  }
+
   // Generate potential file paths for a dependency
   resolveDependencyPaths(dependencyPath, baseRepoInfo) {
     if (!baseRepoInfo) return [];
@@ -107,6 +270,12 @@ class DependencyResolver {
     
     // Clean up the dependency path
     const cleanPath = dependencyPath.replace(/^["']|["']$/g, ''); // Remove quotes
+    
+    // Check for common external libraries that we can try to resolve
+    const commonLibraryUrls = this.tryResolveCommonLibraries(cleanPath);
+    if (commonLibraryUrls.length > 0) {
+      return commonLibraryUrls;
+    }
     
     // Skip if it's an external package or absolute path that we can't resolve
     if (this.isExternalDependency(cleanPath)) {
@@ -159,24 +328,6 @@ class DependencyResolver {
     return [...new Set(potentialPaths)]; // Remove duplicates
   }
 
-  // Check if dependency is external (can't be resolved in same repo)
-  isExternalDependency(dependencyPath) {
-    const externalPatterns = [
-      /^@openzeppelin\//, // OpenZeppelin packages
-      /^@chainlink\//, // Chainlink packages
-      /^hardhat\//, // Hardhat imports
-      /^forge-std\//, // Foundry standard library
-      /^ds-test\//, // DappTools test library
-      /^solmate\//, // Solmate library
-      /^node_modules\//, // Node modules
-      /^npm:/, // NPM packages
-      /^https?:\/\//, // HTTP URLs
-      /^ipfs:\/\//, // IPFS URLs
-    ];
-    
-    return externalPatterns.some(pattern => pattern.test(dependencyPath));
-  }
-
   // Resolve relative paths like ../interfaces/IContract.sol
   resolveRelativePath(relativePath, basePath) {
     if (!basePath) return relativePath;
@@ -199,17 +350,24 @@ class DependencyResolver {
 
   // Check if a dependency file exists and fetch it
   async tryFetchDependency(dependencyPath, baseRepoInfo, verbose = true) {
-    // Skip if already processed or known to be external
+    // Skip if already processed
     if (this.processedDependencies.has(dependencyPath) || 
-        this.failedDependencies.has(dependencyPath) ||
-        this.isExternalDependency(dependencyPath)) {
+        this.failedDependencies.has(dependencyPath)) {
+      return null;
+    }
+
+    // Check if external
+    const isExternal = this.isExternalDependency(dependencyPath);
+    if (isExternal) {
+      if (verbose) console.log(`  ⚠️  External dependency (skipped): ${dependencyPath}`);
+      this.failedDependencies.add(dependencyPath);
       return null;
     }
     
     const potentialUrls = this.resolveDependencyPaths(dependencyPath, baseRepoInfo);
     
     if (potentialUrls.length === 0) {
-      if (verbose) console.log(`  ⚠️  External dependency (skipped): ${dependencyPath}`);
+      if (verbose) console.log(`  ⚠️  No resolution paths found: ${dependencyPath}`);
       this.failedDependencies.add(dependencyPath);
       return null;
     }
@@ -287,36 +445,6 @@ class DependencyResolver {
       failed: failedDependencies,
       processedCount: this.processedDependencies.size,
       failedCount: this.failedDependencies.size
-    };
-  }
-
-  // Recursively resolve dependencies with depth control
-  async resolveRecursively(initialDependencies, baseRepoInfo, maxDepth = 3, verbose = true) {
-    let currentDependencies = [...initialDependencies];
-    let allResolvedFiles = [];
-    let depth = 0;
-    
-    while (currentDependencies.length > 0 && depth < maxDepth) {
-      depth++;
-      
-      if (verbose) {
-        console.log(`\n🔄 Depth ${depth}/${maxDepth}: Processing ${currentDependencies.length} dependencies`);
-      }
-      
-      const result = await this.resolveDependencies(currentDependencies, baseRepoInfo, verbose);
-      allResolvedFiles.push(...result.resolved);
-      
-      // Extract new dependencies from resolved files (this would need parser integration)
-      // For now, we'll break after first iteration - the main analyzer will handle recursion
-      break;
-    }
-    
-    return {
-      resolved: allResolvedFiles,
-      failed: Array.from(this.failedDependencies),
-      totalProcessed: this.processedDependencies.size,
-      totalFailed: this.failedDependencies.size,
-      maxDepthReached: depth >= maxDepth
     };
   }
 
