@@ -3,4 +3,4 @@ veridise/
 zellic/
 problems/
 omniscia/
-node_modules/
+**/node_modules/
