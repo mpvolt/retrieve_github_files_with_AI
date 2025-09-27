@@ -8,7 +8,7 @@ const { URL } = require('url');
 const DependencyResolver = require('./dependency-resolver.js');
 
 class GitHubSolidityAnalyzer {
-  constructor() {
+  constructor(options = {}) {
     this.contracts = new Map(); // filename -> AST
     this.dependencies = new Set();
     this.stateVariables = [];
@@ -18,6 +18,10 @@ class GitHubSolidityAnalyzer {
     this.processedFiles = new Set(); // Track processed files to avoid duplicates
     this.baseRepoInfo = null; // Store repository information for dependency resolution
     this.dependencyResolver = new DependencyResolver();
+    this.options = {
+      includeSourceCode: true, // Whether to include source code in output
+      ...options
+    };
   }
 
   // Convert GitHub blob URL to raw URL
@@ -255,7 +259,7 @@ class GitHubSolidityAnalyzer {
       
       StateVariableDeclaration: (node) => {
         node.variables.forEach(variable => {
-          this.stateVariables.push({
+          const stateVar = {
             name: variable.name,
             type: this.getTypeString(variable.typeName),
             visibility: variable.visibility || 'internal',
@@ -263,17 +267,31 @@ class GitHubSolidityAnalyzer {
             isImmutable: variable.isImmutable || false,
             file: filename,
             location: node.loc
-          });
+          };
+          
+          // Add source code if requested
+          if (this.options.includeSourceCode) {
+            stateVar.sourceCode = this.extractFunctionSource(node, filename);
+          }
+          
+          this.stateVariables.push(stateVar);
         });
       },
 
       ModifierDefinition: (node) => {
-        this.modifiers.push({
+        const modifier = {
           name: node.name,
           parameters: this.extractParameters(node.parameters),
           file: filename,
           location: node.loc
-        });
+        };
+        
+        // Add source code if requested
+        if (this.options.includeSourceCode) {
+          modifier.sourceCode = this.extractFunctionSource(node, filename);
+        }
+        
+        this.modifiers.push(modifier);
       },
 
       FunctionDefinition: (node) => {
@@ -293,6 +311,11 @@ class GitHubSolidityAnalyzer {
           calls: []
         };
 
+        // Add source code if requested
+        if (this.options.includeSourceCode) {
+          functionInfo.sourceCode = this.extractFunctionSource(node, filename);
+        }
+
         // Find function calls within this function
         if (node.body) {
           this.findFunctionCalls(node.body, functionInfo.calls);
@@ -310,6 +333,11 @@ class GitHubSolidityAnalyzer {
           file: filename,
           location: node.loc
         };
+        
+        // Add source code if requested
+        if (this.options.includeSourceCode) {
+          eventInfo.sourceCode = this.extractFunctionSource(node, filename);
+        }
         
         // Add to functions array for simplicity (could create separate events array)
         this.functions.push(eventInfo);
@@ -346,6 +374,48 @@ class GitHubSolidityAnalyzer {
         }
       }
     });
+  }
+
+  // Extract source code for a function from the original file content
+  extractFunctionSource(node, filename) {
+    const sourceCode = this.sourceFiles.get(filename);
+    if (!sourceCode || !node.loc) {
+      return null;
+    }
+
+    try {
+      const lines = sourceCode.split('\n');
+      const startLine = node.loc.start.line - 1; // Convert to 0-based indexing
+      const endLine = node.loc.end.line - 1;
+      const startColumn = node.loc.start.column;
+      const endColumn = node.loc.end.column;
+
+      if (startLine === endLine) {
+        // Single line function
+        return lines[startLine].substring(startColumn, endColumn);
+      } else {
+        // Multi-line function
+        const functionLines = [];
+        
+        // First line (from start column to end)
+        functionLines.push(lines[startLine].substring(startColumn));
+        
+        // Middle lines (complete lines)
+        for (let i = startLine + 1; i < endLine; i++) {
+          functionLines.push(lines[i]);
+        }
+        
+        // Last line (from start to end column)
+        if (endLine < lines.length) {
+          functionLines.push(lines[endLine].substring(0, endColumn));
+        }
+        
+        return functionLines.join('\n');
+      }
+    } catch (error) {
+      console.warn(`Failed to extract source for function in ${filename}: ${error.message}`);
+      return null;
+    }
   }
 
   // Extract function name from expression
@@ -510,6 +580,8 @@ Options:
   --max-depth=N      Maximum recursion depth for dependencies (default: 3)
   --no-common-libs   Skip resolving common libraries (OpenZeppelin, Solady, etc.)
   --libs-only        Only resolve common libraries, skip local dependencies
+  --no-source        Exclude source code from output (smaller file size)
+  --include-source   Include source code in output (default, larger file size)
 
 Examples:
   # Analyze single file with dependency resolution
@@ -527,6 +599,9 @@ Examples:
   # Only resolve common libraries (security analysis focus)
   node solidity-analyzer.js https://github.com/owner/repo/blob/main/Contract.sol --libs-only
 
+  # Exclude source code for smaller output
+  node solidity-analyzer.js https://github.com/owner/repo/blob/main/Contract.sol --no-source
+
   # Analyze multiple files
   node solidity-analyzer.js "url1,url2,url3" analysis.json
 `);
@@ -539,6 +614,7 @@ Examples:
   let maxDepth = 3;
   let resolveCommonLibs = true;
   let libsOnly = false;
+  let includeSourceCode = true;
   
   // Parse arguments
   for (let i = 1; i < args.length; i++) {
@@ -551,13 +627,19 @@ Examples:
       resolveCommonLibs = false;
     } else if (arg === '--libs-only') {
       libsOnly = true;
+    } else if (arg === '--no-source') {
+      includeSourceCode = false;
+    } else if (arg === '--include-source') {
+      includeSourceCode = true;
     } else if (!arg.startsWith('--')) {
       outputFile = arg;
     }
   }
   
   try {
-    const analyzer = new GitHubSolidityAnalyzer();
+    const analyzer = new GitHubSolidityAnalyzer({
+      includeSourceCode: includeSourceCode
+    });
     
     // Configure dependency resolver
     if (!resolveCommonLibs) {
