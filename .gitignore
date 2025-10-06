@@ -1,6 +1,4 @@
 *.json
-veridise/
-zellic/
-problems/
-omniscia/
 **/node_modules/
+test_dataset/
+**/__pycache__/
