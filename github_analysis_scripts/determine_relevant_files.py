@@ -8,11 +8,9 @@ from github_file_retrieval_scripts.retrieve_changed_commits_files import handle_
 from github_file_retrieval_scripts.retrieve_changed_pull_request_files import handle_pr_files_via_api
 from github_file_retrieval_scripts.retrieve_changed_compare_files import handle_compare_files_via_api
 from urllib.parse import urlparse
-
-
-SMART_CONTRACT_EXTENSIONS = (
-        '.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom'
-    )
+from config import SMART_CONTRACT_EXTENSIONS
+from collections import Counter
+import re
 API_KEY = os.getenv('GITHUB_API_KEY')
 
 # Create a session for file validation
@@ -43,6 +41,77 @@ def extract_string_values(obj):
                 strings.extend(extract_string_values(item))
     return strings
 
+def extract_words(text, min_length=3):
+    """
+    Extract meaningful words from text.
+    Splits on underscores, hyphens, and other non-alphanumeric characters,
+    then filters out short/numeric strings.
+    
+    Args:
+        text: String to extract words from
+        min_length: Minimum word length to consider (default: 3)
+    
+    Returns:
+        Set of lowercase words
+    """
+    # Split on underscores, hyphens, and other non-alphanumeric characters
+    # This regex splits on any character that's not a letter or digit
+    words = re.split(r'[^a-zA-Z0-9]+', text.lower())
+    
+    # Filter out empty strings, short words, and numbers-only strings
+    words = [w for w in words if w and len(w) >= min_length and not w.isdigit()]
+    
+    return set(words)
+
+def has_matching_words(filename, url, min_word_length=3):
+    """
+    Determine if a filename and URL share any matching words.
+    
+    This function extracts words from both the filename (excluding extension)
+    and the URL (including domain and path), then checks for common words.
+    Uses a minimum word length of 3 to avoid false positives from common
+    short words like "v2", "src", "sol", etc.
+    
+    Args:
+        filename: The filename to check (e.g., "my-document.pdf")
+        url: The website URL to check (e.g., "https://example.com/my-page")
+        min_word_length: Minimum length for words to be considered (default: 3)
+    
+    Returns:
+        tuple: (bool, set) - True/False if matches exist, and the set of matching words
+    
+    Examples:
+        >>> has_matching_words("filtered_Harvest-Flow-V2-Security-Review.json",
+        ...                    "https://github.com/tokyoweb3/HARVESTFLOW_Ver.2/blob/main/contracts/src/LendingNFT.sol")
+        (True, {'harvest', 'flow'})
+        
+        >>> has_matching_words("filtered_Harvest-Flow-V2-Security-Review.json",
+        ...                    "https://github.com/chiru-labs/ERC721A-Upgradeable/blob/main/contracts/ERC721AUpgradeable.sol")
+        (False, set())
+        
+        >>> has_matching_words("user-guide.pdf", "https://example.com/user/guide")
+        (True, {'user', 'guide'})
+    """
+    # Remove file extension from filename
+    filename_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    
+    # Extract words from filename
+    filename_words = extract_words(filename_without_ext, min_word_length)
+    
+    # Parse URL and extract meaningful parts
+    parsed_url = urlparse(url)
+    
+    # Combine domain and path for word extraction
+    url_text = parsed_url.netloc + parsed_url.path
+    
+    # Extract words from URL
+    url_words = extract_words(url_text, min_word_length)
+    
+    # Find matching words
+    matching_words = filename_words.intersection(url_words)
+    
+    return len(matching_words) > 0, matching_words
+    
 def validate_file_exists(url):
     """
     Validate that a GitHub file URL exists and is accessible.
@@ -103,12 +172,15 @@ def load_reports_from_json(json_file: str) -> List[Dict[str, Any]]:
     return reports
 
 
-def validate_report_urls(report: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+def validate_report_urls(report: Dict[str, Any], json_file: str) -> Tuple[List[str], List[str]]:
     """
     Extract and validate source and fix URLs from a report.
+    Returns URLs that have matching words with the json_file name.
+    If no URLs match, returns all URLs.
     
     Args:
         report: Report dictionary containing URL fields
+        json_file: Name of the JSON file to match against
         
     Returns:
         Tuple of (source_urls, fix_urls) as lists
@@ -117,10 +189,21 @@ def validate_report_urls(report: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     fix_url = report.get("fix_commit_url")
     
     # Convert to lists for uniform processing
-    source_urls = source_url if isinstance(source_url, list) else [source_url] if source_url else []
-    fix_urls = fix_url if isinstance(fix_url, list) else [fix_url] if fix_url else []
+    all_source_urls = source_url if isinstance(source_url, list) else [source_url] if source_url else []
+    all_fix_urls = fix_url if isinstance(fix_url, list) else [fix_url] if fix_url else []
     
-    return source_urls, fix_urls
+    # Filter source URLs by matching words
+    matching_source_urls = [url for url in all_source_urls if has_matching_words(json_file, url)]
+    
+    # Filter fix URLs by matching words
+    matching_fix_urls = [url for url in all_fix_urls if has_matching_words(json_file, url)]
+    
+    # If no matches found in either list, return all URLs
+    if not matching_source_urls and not matching_fix_urls:
+        return all_source_urls, all_fix_urls
+    
+    # Otherwise, return only the matching ones
+    return matching_source_urls, matching_fix_urls
 
 
 def extract_search_data(report: Dict[str, Any]) -> str:
@@ -421,75 +504,149 @@ def filter_test_files(file_urls: Set[str]) -> List[str]:
     """
     return [f for f in file_urls if ".t." not in f]
 
-def process_single_report(report: Dict[str, Any], report_index: int, processed_urls: Dict[str, List[str]]) -> Tuple[str, List[str]]:
+
+def get_repo_key(url: str) -> str:
+    """Extract owner/repo from a GitHub URL."""
+    try:
+        parts = urlparse(url).path.strip("/").split("/")
+        return f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else None
+    except Exception:
+        return None
+
+
+def get_newest_github_url(urls: list) -> list:
+    """
+    Given a list of GitHub URLs, return the newest one(s).
+    - Groups by repo, processes only the most common repo.
+    - Supports commit, pull, compare, tree, and blob URLs.
+    - If an error occurs, falls back to returning all URLs.
+    Returns a list of URLs (could be more than one if repos tie).
+    """
+    if not urls:
+        return []
+
+    if len(urls) == 1:
+        return urls
+
+    try:
+        # Find most common repo
+        repo_keys = [get_repo_key(u) for u in urls if get_repo_key(u)]
+        if not repo_keys:
+            return urls  # fallback: no valid repos
+        most_common_repo, freq = Counter(repo_keys).most_common(1)[0]
+
+        # Filter URLs to only that repo
+        urls = [u for u in urls if get_repo_key(u) == most_common_repo]
+
+        session = requests.Session()
+        session.headers.update({'Authorization': f'token {API_KEY}'})
+
+        commits = []
+        for url in urls:
+            parsed = urlparse(url)
+            parts = parsed.path.strip("/").split("/")
+            owner, repo = parts[0], parts[1]
+            kind = parts[2] if len(parts) > 2 else None
+
+            sha = None
+            if kind == "commit":
+                sha = parts[3]
+            elif kind == "tree":
+                branch_or_tag = parts[3]
+                api_url = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch_or_tag}"
+                resp = session.get(api_url)
+                resp.raise_for_status()
+                sha = resp.json()["commit"]["sha"]
+            elif kind == "compare":
+                base, head = parts[3].split("...")
+                sha = head
+            elif kind == "pull":
+                pr_number = parts[3]
+                api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+                resp = session.get(api_url)
+                resp.raise_for_status()
+                sha = resp.json()["head"]["sha"]
+            elif kind == "blob":
+                # Blob URLs don’t have commits; keep them directly
+                commits.append(("9999-12-31T23:59:59Z", url))
+                continue
+            else:
+                continue  # skip unsupported URLs
+
+            # Lookup commit timestamp
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}"
+            resp = session.get(api_url)
+            resp.raise_for_status()
+            commit_data = resp.json()
+            commit_date = commit_data["commit"]["committer"]["date"]
+            commits.append((commit_date, url))
+
+        if not commits:
+            return urls  # fallback: nothing parsed correctly
+
+        # Sort by date descending
+        commits.sort(reverse=True, key=lambda x: x[0])
+        return [commits[0][1]]
+
+    except Exception as e:
+        print(f"⚠️ Error in get_newest_github_url: {e}, falling back to all URLs")
+        return urls
+
+
+def determine_relevant_files(report: Dict[str, Any], report_index: int, processed_urls: Dict[str, List[str]], json_file: str) -> Tuple[str, List[str]]:
     """
     Process a single report to extract relevant files.
-    
-    Args:
-        report: Report dictionary
-        report_index: Index of the report for naming purposes
-        processed_urls: Dictionary mapping URLs to their cached results
-        
-    Returns:
-        Tuple of (report_title, relevant_files_list)
     """
-    report_title = report.get('title', f'Untitled_Report_{report_index+1}')
-    print(f"\n{'='*50}")
-    print(f"Processing report {report_index+1}: {report_title}")
-    print(f"{'='*50}")
-    
     # Validate URLs
-    source_urls, fix_urls = validate_report_urls(report)
+    source_urls, fix_urls = validate_report_urls(report, json_file)
     print(f"Source Urls: {source_urls}")
     print(f"Fix Urls: {fix_urls}")
-    
+
     if not source_urls and not fix_urls:
         print("Error: JSON must contain either 'source_code_url' or 'fix_commit_url'.")
-        return report_title, []
-    
-    # Extract search data (for future semantic analysis)    
+        return []
+
     relevant_files_set = set()
 
-    # If the source url exists and is already a blob, no processing needed
+    # --- Process source URLs ---
     if source_urls:
-        for source_url in source_urls:
-            if 'github.com' in source_url and '/blob/' in source_url:
-                print(f"Using GitHub blob as relevant file: {source_url}")
-                relevant_files_set.update([source_url])
-    
-    #Otherwise process fix URLs and see which files changed + other smart contract files
-    if not relevant_files_set and fix_urls:
-        for fix_url in fix_urls:
-            if fix_url in processed_urls:
-                print(f"Using cached results for fix URL: {fix_url}")
-                relevant_files_set.update(processed_urls[fix_url])
+        newest_sources = get_newest_github_url(source_urls)
+        for src in newest_sources:
+            if src in processed_urls:
+                print(f"Using cached results for source URL: {src}")
+                relevant_files_set.update(processed_urls[src])
+            elif 'github.com' in src and '/blob/' in src:
+                print(f"Using GitHub blob as relevant file: {src}")
+                processed_urls[src] = [src]
+                relevant_files_set.add(src)
             else:
-                print(f"Processing fix URL: {fix_url}")
-                changed_files = process_fix_url(fix_url, True)
-                processed_urls[fix_url] = list(changed_files)
+                print(f"Processing source URL: {src}")
+                new_files = process_source_url(src)
+                processed_urls[src] = list(new_files)
+                relevant_files_set.update(new_files)
+
+    # --- Process fix URLs ---
+    if fix_urls:
+        newest_fixes = get_newest_github_url(fix_urls)
+        for fix in newest_fixes:
+            if fix in processed_urls:
+                print(f"Using cached results for fix URL: {fix}")
+                relevant_files_set.update(processed_urls[fix])
+            else:
+                print(f"Processing fix URL: {fix}")
+                changed_files = process_fix_url(fix, True)
+                processed_urls[fix] = list(changed_files)
                 relevant_files_set.update(changed_files)
 
-    #If no fix url, use source url if it exists
-    if not relevant_files_set and source_urls:
-        # Process source URLs if no fix URLs
-        for source_url in source_urls:
-            if source_url in processed_urls:
-                print(f"Using cached results for source URL: {source_url}")
-                relevant_files_set.update(processed_urls[source_url])
-            else:
-                print(f"Processing source URL: {source_url}")
-                new_files = process_source_url(source_url)
-                processed_urls[source_url] = list(new_files)
-                relevant_files_set.update(new_files)
-    
-    # Filter out test (.t.) files and convert to list
+    # Filter out test (.t.) files
     relevant_files = filter_test_files(relevant_files_set)
-    
+
     # Print results
     for file_url in relevant_files:
         print(f"  - {file_url}")
-    
-    return report_title, relevant_files
+
+    return relevant_files
+
 
 
 def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[str, Any]]]:
@@ -514,8 +671,9 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
     # Process each report
     for i, report in enumerate(reports):
-        report_title, relevant_files = process_single_report(report, i, processed_urls)
-        results_dict[report_title] = relevant_files
+        relevant_files = determine_relevant_files(report, i, processed_urls, json_file)
+        title = report.get("title", "Unknown title")
+        results_dict[title] = relevant_files
     
     print(f"\n{'='*50}")
     print(f"Processing complete. Processed {len(processed_urls)} unique URLs.")
@@ -528,16 +686,8 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
 
 def main():
-    json_file = "/mnt/d/golden_dataset/bailsec/filtered_Bailsec - Defi Money Fee Module - Final Report.json"
-
-    # Load JSON file
-    #results = get_relevant_files(json_file)
-    #print(results)
-    find_file_before_change(
-    "https://github.com/defidotmoney/dfm-contracts/commit/9757a634244ab35b1a97797040e699e038158e92",
-    "https://github.com/defidotmoney/dfm-contracts/blob/9757a634244ab35b1a97797040e699e038158e92/contracts/fees/dependencies/FeeConverterBase.sol",
-    debug=True
-)
+    json_file = "/Users/matt/vulnaut/retrieve_github_files_with_AI/test_dataset/0xGuard/filtered_Anyrand.json"
+    get_relevant_files(json_file)
 
 
 if __name__ == "__main__":

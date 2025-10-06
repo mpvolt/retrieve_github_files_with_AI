@@ -32,27 +32,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 from typing import List, Dict, Tuple, Optional, Set
-
-SMART_CONTRACT_EXTENSIONS = {
-    '.sol': 'Solidity',
-    '.tsol': "Solidity (test)",
-    '.vy': 'Vyper', 
-    '.rs': 'Rust (Solana/NEAR)',
-    '.cairo': 'Cairo (StarkNet)',
-    '.move': 'Move (Aptos/Sui)',
-    '.fc': 'FunC (TON)',
-    '.func': 'FunC (TON)',
-    '.clar': 'Clarity (Stacks)',
-    '.scilla': 'Scilla (Zilliqa)',
-    '.ligo': 'LIGO (Tezos)',
-    '.mligo': 'LIGO (Tezos)',
-    '.religo': 'LIGO (Tezos)',
-    '.jsligo': 'LIGO (Tezos)',
-    '.aes': 'Sophia (Aeternity)',
-    '.ride': 'Ride (Waves)',
-    '.teal': 'TEAL (Algorand)',
-    '.circom': 'ZK Circuits'
-}
+from config import SMART_CONTRACT_EXTENSIONS
 
 
 class GitHubGraphQLRetriever:
@@ -71,13 +51,10 @@ class GitHubGraphQLRetriever:
         self.graphql_url = "https://api.github.com/graphql"
         self.max_graphql_depth = 8  # Configurable max depth for GraphQL queries
     
-    def is_smart_contract_file(self, filename: str) -> Tuple[bool, str]:
-        """Check if file is a smart contract based on extension."""
+    def is_smart_contract_file(self, filename: str) -> bool:
+        """Check if a file is a smart contract based on its extension."""
         filename_lower = filename.lower()
-        for ext, language in SMART_CONTRACT_EXTENSIONS.items():
-            if filename_lower.endswith(ext.lower()):
-                return True, language
-        return False, ''
+        return filename_lower.endswith(SMART_CONTRACT_EXTENSIONS)
     
     def build_tree_fragment(self, depth: int) -> str:
         """Recursively build GraphQL tree fragment for specified depth."""
@@ -197,7 +174,7 @@ class GitHubGraphQLRetriever:
             
             if entry['type'] == 'blob':
                 # Check if it's a smart contract file
-                is_contract, language = self.is_smart_contract_file(entry['name'])
+                is_contract = self.is_smart_contract_file(entry['name'])
                 
                 if is_contract and entry.get('object'):
                     blob = entry['object']
@@ -214,7 +191,6 @@ class GitHubGraphQLRetriever:
                             'path': entry_path,
                             'content': content,
                             'size': blob.get('byteSize', len(content)),
-                            'language': language,
                             'lines': len(content.splitlines()),
                             'is_valid': True
                         })
@@ -297,7 +273,7 @@ class GitHubGraphQLRetriever:
                 
                 for file_path in paths:
                     filename = file_path.split('/')[-1]
-                    is_contract, _ = self.is_smart_contract_file(filename)
+                    is_contract = self.is_smart_contract_file(filename)
                     if is_contract:
                         smart_contract_paths.append(file_path)
                 
@@ -409,10 +385,9 @@ class GitHubRestRetriever:
     def is_smart_contract_file(self, filename: str) -> Tuple[bool, str]:
         """Check if file is a smart contract based on extension."""
         filename_lower = filename.lower()
-        for ext, language in SMART_CONTRACT_EXTENSIONS.items():
-            if filename_lower.endswith(ext.lower()):
-                return True, language
-        return False, ''
+        if filename_lower.endswith(SMART_CONTRACT_EXTENSIONS):
+            return True
+        return False
 
     def get_commit_sha(self, owner: str, repo: str, branch: str) -> Optional[str]:
         """Resolve branch to commit SHA using REST API."""
@@ -465,7 +440,7 @@ class GitHubRestRetriever:
                 continue
 
             filename = item["path"].split("/")[-1]
-            is_contract, language = self.is_smart_contract_file(filename)
+            is_contract = self.is_smart_contract_file(filename)
             if not is_contract:
                 continue
 
@@ -479,7 +454,6 @@ class GitHubRestRetriever:
                 "path": item["path"],
                 "content": content,
                 "size": len(content),
-                "language": language,
                 "lines": len(content.splitlines()),
                 "is_valid": True
             })
@@ -629,23 +603,18 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
                     'subpath': subpath,
                     'total_files': 0,
                     'extensions': {},
-                    'languages': {},
                     'method_used': method_used
                 }
             }
         
         # Generate summary statistics
         extensions = {}
-        languages = {}
         total_content_size = 0
         total_lines = 0
         
         for file_info in smart_contract_files:
             ext = Path(file_info['name']).suffix.lower()
             extensions[ext] = extensions.get(ext, 0) + 1
-            
-            lang = file_info.get('language', 'Unknown')
-            languages[lang] = languages.get(lang, 0) + 1
             
             total_content_size += len(file_info['content'])
             total_lines += file_info.get('lines', 0)
@@ -661,7 +630,6 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
             'subpath': subpath,
             'total_files': len(smart_contract_files),
             'extensions': extensions,
-            'languages': languages,
             'total_content_size': total_content_size,
             'total_lines': total_lines,
             'method_used': method_used
@@ -677,11 +645,6 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
             print(f"Files retrieved: {summary['total_files']}")
             print(f"Total content: {summary['total_content_size']:,} characters")
             print(f"Total lines: {summary['total_lines']:,}")
-            
-            if summary['languages']:
-                print("\nLanguages found:")
-                for lang, count in sorted(summary['languages'].items()):
-                    print(f"  {lang}: {count} files")
         
         return {
             'files': smart_contract_files,
@@ -697,7 +660,6 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
                 'repository': 'Unknown',
                 'total_files': 0,
                 'extensions': {},
-                'languages': {},
                 'method_used': 'error',
                 'error': str(e)
             }
@@ -775,7 +737,7 @@ if __name__ == "__main__":
     if results['files']:
         print(f"\n📄 Smart contract files:")
         for i, file in enumerate(results['files'], 1):
-            print(f"{i}. {file['path']} ({file['language']})")
+            print(f"{i}. {file['path']}")
             print(f"   Size: {file['size']:,} chars, Lines: {file.get('lines', 'N/A')}")
             print(f"   Preview: {file['content'][:100].replace(chr(10), ' ')}...")
             print()

@@ -113,7 +113,7 @@ def process_single_json_file(json_file_str: str, rate_manager, max_retries=3):
         if not any(
             key in obj
             for obj in (data if isinstance(data, list) else [data])
-            for key in ("source_code_url", "fix_commit_url", "afflicted_github_code_blob")
+            for key in ("source_code_url", "fix_commit_url", "afflicted_github_code_blob", "afflicted_source_code")
         ):
             logger.info(f"Skipping {json_file_str}: no relevant fields")
             return True, json_file_str
@@ -128,12 +128,12 @@ def process_single_json_file(json_file_str: str, rate_manager, max_retries=3):
                 success = analyze_relevant_files(json_file_str)
 
                 #Retrieve relevant code context from github blobs to train AI
-                github_source_code_analyzer = GitHubCodeAnalyzer(GITHUB_API_KEY, OPENAI_API_KEY)
-                github_source_code_analyzer.process_single_json_file(json_file_str)
+                # github_source_code_analyzer = GitHubCodeAnalyzer(GITHUB_API_KEY, OPENAI_API_KEY)
+                # github_source_code_analyzer.process_single_json_file(json_file_str)
 
                 #Determine if broken/fixed code snippets have enough context to train AI
-                code_snippet_analyzer = VulnerabilityAnalyzer(OPENAI_API_KEY, "gpt-4.1-mini")
-                code_snippet_analyzer.process_single_file(json_file_str)
+                # code_snippet_analyzer = VulnerabilityAnalyzer(OPENAI_API_KEY, "gpt-4.1-mini")
+                # code_snippet_analyzer.process_single_file(json_file_str)
 
                 if success is not None:
                     logger.info(f"Successfully processed {json_file_str}")

@@ -5,21 +5,17 @@ import os
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 from fuzzywuzzy import fuzz
-from github_analysis_scripts.determine_relevant_files import get_relevant_files, process_fix_url, process_source_url, find_file_before_change
-from github_file_retrieval_scripts.retrieve_all_smart_contract_functions import extract_function_names
+from github_analysis_scripts.determine_relevant_files import determine_relevant_files, process_fix_url, process_source_url, find_file_before_change
 from github_analysis_scripts.match_files_to_report_with_heuristics import match_bug_to_files
 from github_analysis_scripts.match_files_to_report_with_AI import VulnerabilityFileMatcher
 import requests
 import time
 from urllib.parse import urlparse, unquote
+from config import SMART_CONTRACT_EXTENSIONS, SMART_CONTRACT_LANGUAGES
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 GITHUB_API_KEY = os.getenv("GITHUB_API_KEY")
-
-SMART_CONTRACT_EXTENSIONS = (
-        '.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom'
-    )
 
 def parse_github_url(github_url: str) -> Dict:
     """Parse GitHub URL and extract components."""
@@ -233,6 +229,8 @@ def assign_afflicted_blob_url(report, high_confidence_matches):
 
 def create_summary_result(report_id, report_title, report, top_match):
     """Create a summary result entry for reporting."""
+    if isinstance(top_match, list):
+        top_match = top_match[0]
     return {
         'id': report_id,
         'title': report_title,
@@ -308,22 +306,92 @@ def print_summary_header():
     print(f"{'ID':<8} {'Severity':<12} {'Title':<35} {'File Match':<30} {'Score':<8}")
     print("-" * 80)
 
-
 def print_summary_row(result):
     """Print a single row in the summary table."""
-    report_id = str(result['id'])[:7]  # Truncate long IDs
-    severity = result['severity'][:11]  # Truncate long severities
-    title = result['title'][:34] + '...' if len(result['title']) > 34 else result['title']
     
-    if result['top_match']:
+    # Extract and format basic fields
+    report_id = str(result.get('id', 'N/A'))[:7]
+    severity = result.get('severity', 'Unknown')[:11]
+    title = result.get('title', 'No title')
+    title_display = (title[:34] + '...') if len(title) > 34 else title[:35]
+    
+    # Extract filename and score from top_match
+    file_match = "No match"
+    score = "N/A"
+    
+    if result.get("top_match"):
         top_match = result["top_match"]
-        file_name = top_match.file_path.split('/')[-1][:29]  # Get filename, truncate if needed
-        score = f"{top_match.total_score:.1f}"
         
-        
-        print(f"{report_id:<8} {severity:<12} {title:<35} {file_name:<30} {score:<8}")
-    else:
-        print(f"{report_id:<8} {severity:<12} {title:<35} {'NO HIGH CONF MATCH':<30} {'N/A':<8}")
+        # Parse the string to extract URL
+        if isinstance(top_match, str):
+            import re
+            urls = re.findall(r'https://github\.com/[^\s\'\]]+', top_match)
+            if urls:
+                # Extract just the filename from the URL
+                filename = urls[0].split('/')[-1]
+                file_match = filename[:29] if len(filename) <= 29 else filename[:26] + '...'
+        elif isinstance(top_match, list) and top_match:
+            filename = str(top_match[0]).split('/')[-1]
+            file_match = filename[:29] if len(filename) <= 29 else filename[:26] + '...'
+    
+    # Get score if available
+    if result.get("score"):
+        score = str(result["score"])
+    elif result.get("top_match_score"):
+        score = str(result["top_match_score"])
+    
+    # Print formatted row matching header alignment
+    print(f"{report_id:<8} {severity:<12} {title_display:<35} {file_match:<30} {score:<8}")
+
+# Alternative: Simple table format without colors
+def print_summary_row_simple(result):
+    """Print a single row in a simple table format."""
+    
+    report_id = str(result.get('id', 'N/A'))[:12]
+    severity = result.get('severity', 'Unknown')[:10]
+    title = result.get('title', 'No title')
+    title_display = (title[:45] + '...') if len(title) > 45 else title
+    
+    # Extract filename from top_match
+    top_match_file = "No match"
+    if result.get("top_match"):
+        top_match = result["top_match"]
+        if isinstance(top_match, str):
+            import re
+            urls = re.findall(r'https://[^\s\'\]]+', top_match)
+            if urls:
+                top_match_file = urls[0].split('/')[-1][:25]
+        elif isinstance(top_match, list) and top_match:
+            top_match_file = str(top_match[0]).split('/')[-1][:25]
+    
+    # Print as a clean table row
+    print(f"{report_id:<13} | {severity:<10} | {top_match_file:<26} | {title_display}")
+
+# Alternative: Compact format
+def print_summary_row_compact(result):
+    """Print in a compact, readable format."""
+    
+    report_id = result.get('id', 'N/A')
+    severity = result.get('severity', 'Unknown')
+    title = result.get('title', 'No title')
+    
+    # Extract clean filename
+    match_file = "No match found"
+    if result.get("top_match"):
+        import re
+        top_match = str(result["top_match"])
+        urls = re.findall(r'https://github\.com/[^\s\'\]]+', top_match)
+        if urls:
+            # Get repo/file path
+            parts = urls[0].replace('https://github.com/', '').split('/')
+            if len(parts) >= 5:
+                match_file = f"{parts[0]}/{parts[1]}/.../{parts[-1]}"
+    
+    print(f"\n[{severity.upper()}] {report_id}")
+    print(f"  Title: {title}")
+    print(f"  Match: {match_file}")
+    print("-" * 80)
+
 
 
 def print_statistics(summary_results):
@@ -348,7 +416,7 @@ def print_severity_breakdown(summary_results):
         if severity not in severity_stats:
             severity_stats[severity] = {'total': 0, 'matched': 0}
         severity_stats[severity]['total'] += 1
-        if result['top_match']:
+        if result.get("top_match"):
             severity_stats[severity]['matched'] += 1
     
     if len(severity_stats) > 1:
@@ -372,29 +440,34 @@ def print_final_summary(all_matches):
     print(f"\nTOTAL HIGH CONFIDENCE MATCHES RETURNED: {total_returned_matches}")
 
 
-MAX_FILES_TO_CHECK = 20
 MAX_FIELD_LENGTH = 1000
 
 def truncate_field(value, default, max_len=MAX_FIELD_LENGTH):
-    """Return string value truncated to max_len, or default if None."""
-    val = value if value is not None else default
-    return str(val)[:max_len]
+    """Return value truncated to max_len if it's a string; use default if None."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value[:max_len]
+    return value  # leave lists, dicts, numbers, etc. as-is
+
 
 def extract_report_fields(report, i):
     """Extract and normalize all fields from a report dynamically."""
     fields = {}
     for key, value in report.items():
-        # Use key-based default like Report_{i+1}, ID_{i+1}, etc.
-        default_value = f'{key}_{i+1}' if value is None else ''
+        # Use key-based default only when the value is None
+        default_value = f"{key}_{i+1}" if value is None else value
         fields[key] = truncate_field(value, default_value)
     return fields
 
+
 def should_use_ai(report, relevant_files):
+    MAX_FILES_TO_CHECK = 20
     """Decide whether to use AI first, based on URLs and number of files."""
-    if report.get("fix_commit_url") and len(relevant_files) < MAX_FILES_TO_CHECK:
-        return "fix_commit"
-    elif report.get("source_code_url") and len(relevant_files) < MAX_FILES_TO_CHECK:
+    if report.get("source_code_url"):# and len(relevant_files) < MAX_FILES_TO_CHECK:
         return "source_code"
+    elif report.get("fix_commit_url"):# and len(relevant_files) < MAX_FILES_TO_CHECK:
+        return "fix_commit"   
     return None
 
 MIN_HEURISTICS_THRESHOLD = 20
@@ -434,182 +507,334 @@ def run_heuristics_matching(report, relevant_files):
     #print_match_results(report["title"], matched_files, high_confidence_matches)
     return high_confidence_matches
 
-def process_single_report(report, i, relevant_files_dict):
-    """Process a single bug report and return match results."""
+def initialize_report_fields(report):
+    """Ensure required fields exist in the report."""
+    report.setdefault("afflicted_github_code_blob", [])
+    report.setdefault("fixed_github_code_blob", [])
+    report.setdefault("relevant_functions", {})
+    report.setdefault("languages", [])
 
+def handle_source_blob_urls(report):
+    """Check source_code_url for direct GitHub blob references."""
+    source_code_url = report.get("source_code_url")
+    if not source_code_url:
+        return 
+
+    urls_to_check = source_code_url if isinstance(source_code_url, list) else [source_code_url]
+    afflicted_github_code_blobs = []
+    for url in urls_to_check:
+        if isinstance(url, str) and "github.com" in url and "/blob/" in url:
+            filename = url.strip().split("/")[-1]
+            if filename and any(filename.endswith(SMART_CONTRACT_EXTENSIONS)):
+                afflicted_github_code_blob.append(url)
+    
+    report["afflicted_github_code_blob"] = afflicted_github_code_blobs
+    if report.get("afflicted_github_code_blob") and not report.get("context"):
+        print("Case 2: source code url is already a blob")
+        determine_relevant_functions(report)
+
+
+def handle_fix_commit_blobs(report):
+    """Extract fixed blobs from fix_commit_url if present."""
+    fix_commit_url = report.get("fix_commit_url")
+    if not fix_commit_url:
+        return
+
+    urls_to_check = fix_commit_url if isinstance(fix_commit_url, list) else [fix_commit_url]
+    for url in urls_to_check:
+        if isinstance(url, str) and "github.com" in url and "/blob/" in url:
+            filename = url.strip().split("/")[-1]
+            if filename and any(filename.endswith(SMART_CONTRACT_EXTENSIONS)):
+                report["fixed_github_code_blob"].append(url)
+
+    if report.get("fixed_github_code_blob"):
+        print("Case 3: fix commit url is already a blob")
+
+
+
+def handle_ai_strategy(report, fields, relevant_files):
+    """Run AI-based processing depending on strategy, with robust error handling."""
+
+    print("Using AI strategy")
+
+    try:
+        ai_strategy = should_use_ai(report, relevant_files)
+    except Exception as e:
+        print(f"[Error] Failed to determine AI strategy: {e}")
+        report["ai_strategy_error"] = str(e)
+        return report  # stop early since we can’t proceed
+
+    try:
+        matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+    except Exception as e:
+        print(f"[Error] Failed to initialize VulnerabilityFileMatcher: {e}")
+        report["matcher_init_error"] = str(e)
+        return report
+
+    try:
+        if ai_strategy == "fix_commit":
+            print("Using fix commit strategy")
+            matches = matcher.process_files(fields, relevant_files)
+
+            if not matches:
+                print("[Info] No matches found initially, trying fix_commit_url...")
+                try:
+                    relevant_files = process_fix_url(report.get("fix_commit_url"), False)
+                    matches = matcher.process_files(fields, relevant_files)
+                except Exception as e:
+                    print(f"[Error] Failed processing fix_commit_url: {e}")
+                    report["fix_commit_error"] = str(e)
+
+            fixed_code_blobs = []
+            for match in matches or []:
+                try:
+                    fix_commit_url = report.get("fix_commit_url", "")
+                    if any(k in fix_commit_url for k in ["tree", "compare", "commit"]):
+                        original_blob_url = find_file_before_change(fix_commit_url, match.blob_url)
+                        if original_blob_url and original_blob_url != "NEW FILE":
+                            match.blob_url = original_blob_url
+                            fixed_blob = matcher.construct_blob_from_ref(
+                                report.get("fix_commit_url"), original_blob_url
+                            )
+                            fixed_code_blobs.append(fixed_blob)
+                except Exception as e:
+                    print(f"[Warning] Error handling match {match}: {e}")
+
+            report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
+            report["fixed_github_code_blob"] = fixed_code_blobs or []
+
+        elif ai_strategy == "source_code":
+            print("Using source code strategy")
+            try:
+                matches = matcher.process_files(fields, relevant_files)
+                report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
+            except Exception as e:
+                print(f"[Error] Failed processing source_code strategy: {e}")
+                report["source_code_error"] = str(e)
+
+        else:
+            print(f"[Info] No recognized AI strategy: {ai_strategy}")
+            report["ai_strategy_error"] = f"Unrecognized strategy: {ai_strategy}"
+
+    except Exception as e:
+        print(f"[Critical] Unexpected error in handle_ai_strategy: {e}")
+        report["general_ai_error"] = str(e)
+
+    return report
+
+
+def determine_relevant_functions(report):
+    """
+    Determines relevant functions from a vulnerability report with error handling.
+    
+    Args:
+        report: Dictionary containing vulnerability report data
+        
+    Returns:
+        dict: The report with added context, or None if critical errors occur
+    """
+    try:
+        # Validate report input
+        if not report or not isinstance(report, dict):
+            print("Error: Invalid report - must be a non-empty dictionary")
+            return None
+        
+        # Extract fields with error handling
+        try:
+            fields = extract_report_fields(report, 0)
+            if not fields:
+                print("Warning: No fields extracted from report")
+                return report
+        except Exception as e:
+            print(f"Error extracting report fields: {e}")
+            return report
+        
+        # Initialize matcher with error handling
+        try:
+            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+        except Exception as e:
+            print(f"Error initializing VulnerabilityFileMatcher: {e}")
+            return report
+        
+        context = []
+        
+        # Process GitHub code blobs
+        blobs = report.get("afflicted_github_code_blob", [])
+        if blobs and not isinstance(blobs, list):
+            print("Warning: afflicted_github_code_blob is not a list, skipping")
+            blobs = []
+        
+        for blob in blobs:
+            try:
+                result = matcher.score_function_matches(fields, blob)
+                
+                if not result or not isinstance(result, dict):
+                    print(f"Warning: Invalid result for blob, skipping")
+                    continue
+                
+                print(f"Found {result.get('total_functions_found', 0)} functions")
+                print(f"Analyzed in {result.get('total_chunks', 1)} chunks")
+                
+                # Extract high-risk functions safely
+                functions = result.get("functions", [])
+                if not isinstance(functions, list):
+                    print("Warning: Functions is not a list, skipping")
+                    continue
+                
+                high_risk_functions = [
+                    func for func in functions 
+                    if isinstance(func, dict) and func.get('score', 0) > 85
+                ]
+                
+                if high_risk_functions:
+                    context.append({
+                        "source": blob,
+                        "functions": high_risk_functions
+                    })
+                    
+            except Exception as e:
+                print(f"Error processing blob: {e}")
+                continue
+        
+        # Process afflicted source code
+        afflicted_code = report.get("afflicted_source_code")
+        if afflicted_code:
+            try:
+                result = matcher._analyze_code_chunk(
+                    fields, 
+                    afflicted_code, 
+                    "", 
+                    0, 
+                    1
+                )
+                
+                if result and isinstance(result, dict):
+                    functions = result.get("functions", [])
+                    if isinstance(functions, list):
+                        high_risk_functions = [
+                            func for func in functions 
+                            if isinstance(func, dict) and func.get('score', 0) > 85
+                        ]
+                        
+                        if high_risk_functions:
+                            # Note: Using afflicted_code as source since blob isn't defined here
+                            context.append({
+                                "source": "afflicted_source_code",
+                                "functions": high_risk_functions
+                            })
+                else:
+                    print("Warning: Invalid result from afflicted_source_code analysis")
+                    
+            except Exception as e:
+                print(f"Error processing afflicted_source_code: {e}")
+        
+        # Add context to report
+        report["context"] = context
+        return report
+        
+    except Exception as e:
+        print(f"Critical error in determine_relevant_functions: {e}")
+        return None
+
+def assign_functions_and_languages(report):
+    """Determine relevant functions and detect languages from afflicted blobs."""
+
+    languages = []
+    determine_relevant_functions(report)
+    for github_blob in report["afflicted_github_code_blob"]: 
+        print(github_blob)       
+        # Detect language from extension
+        ext = '.' + github_blob.split('.')[-1].lower()
+        lang = SMART_CONTRACT_LANGUAGES.get(ext)
+        languages.append(lang)
+
+    if not report.get("language"):
+        report["language"] = languages
+
+def process_single_report(report, i, processed_urls, json_file):
+    """
+    Orchestrator: process a single bug report in-place and update it.
+    """
     # Extract normalized fields
     fields = extract_report_fields(report, i)
-    report.update(fields)  # overwrite with truncated values
+    report.update(fields)
 
-    # Get relevant files
-    relevant_files = relevant_files_dict.get(fields["title"], [])
+    # Attach relevant files
     print(f"\nProcessing report: {fields['title']}")
-    print(f"Found {len(relevant_files)} relevant files")
 
-    #Run heuristics matching to determine relevant files before processing with AI
-    heuristics_processed_files = run_heuristics_matching(report, relevant_files)
-    print(heuristics_processed_files)
-    print(f"Heuristics Matching returned {len(heuristics_processed_files)}, now using GPT4.1")
+    # Case 1: already has afflicted blobs → just get functions/languages, no further processing
+    if report.get("afflicted_github_code_blob"):
+        print("Case 1: already has afflicted blobs")
+        assign_functions_and_languages(report)
+        return report
 
-    # Decide strategy
-    ai_strategy = should_use_ai(report, heuristics_processed_files)
-    
-    if ai_strategy == "fix_commit":
+    # Case 2: source code url is already a blob -> needs special processing
+    handle_source_blob_urls(report)
 
-        #Use AI to check files that were returned by heuristics matching 
-        if heuristics_processed_files:
-            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-            matches = matcher.process_files(fields, heuristics_processed_files)
+    # Case 3: fix commit url is already a blob -> needs special processing
+    handle_fix_commit_blobs(report)
 
-            #No High Confidance Match? Check all smart contract files in repo in case the commit/pull is wrong
-            if not matches:
-                relevant_files = process_fix_url(report.get("fix_commit_url"), False)
-                matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-                matches = matcher.process_files(fields, relevant_files)
-        
-        #No Heuristics matched files? default to AI to check them all
-        else:
-            relevant_files = process_fix_url(report.get("fix_commit_url"), False)
-            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-            matches = matcher.process_files(fields, relevant_files)
+    # Case 4 (Normal Case): Process source/fix url using AI-based matching strategy
+    relevant_files = determine_relevant_files(report, i, processed_urls, json_file)
+    handle_ai_strategy(report, fields, relevant_files)
 
-        #Still no high confidance matches? Return empty
-        if not matches:
-            return []
+    # Case 5: extract relevant function names + coding language used
+    assign_functions_and_languages(report)
 
-        else:
-            #Commit url isn't necessary the one where the file was changed
-            #Determine the commit where the file was changed
-            for match in matches:
-                fix_commit_url = report.get("fix_commit_url", "")
-                if any(keyword in fix_commit_url for keyword in ["tree", "compare", "commit"]):
-                    # Call the renamed function
-                    original_blob_url = find_file_before_change(fix_commit_url, match.blob_url)
-                    
-                    # Only update if we found a valid result
-                    if original_blob_url and original_blob_url != "NEW FILE":
-                        match.blob_url = original_blob_url
-            return matches
-
-    elif ai_strategy == "source_code":
-
-        if heuristics_processed_files:
-            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-            matches = matcher.process_files(fields, heuristics_processed_files)
-
-            if not matches:
-                relevant_files = process_source_url(report.get("source_code_url"))
-                matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-                matches = matcher.process_files(fields, relevant_files)
-
-        else:
-            relevant_files = process_source_url(report.get("source_code_url"))
-            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-            matches = matcher.process_files(fields, relevant_files)
-
-        if not matches:
-            return []
-
-        else: 
-            return matches
-
-    else:
-        return []
+    return report
 
 def analyze_relevant_files(json_file):
-    """Main function to process bug reports from JSON file and match them to files."""
-    print(json_file)
 
+    print(json_file)
     validate_api_keys()
 
-    # Get all relevant files AND the reports data from the JSON
-    relevant_files_dict, reports = get_relevant_files(json_file)
-        
-    # Normalize reports data
+    with open(json_file, "r", encoding="utf-8") as f:
+        reports = json.load(f)
     reports = normalize_reports_data(reports)
-    
+
     all_matches = {}
-    summary_results = []  # Store top results for final summary
-    
-    # Process each report
+    summary_results = []
+    processed_urls = {}
+
     for i, report in enumerate(reports):
-
-        # ✅ Just get code context if afflicted_github_code_blob already exists and is non-empty
-        if report.get("afflicted_github_code_blob"):
-            print(f"Report {report.get('id', i)} already has afflicted_github_code_blob, retrieving context")
-            continue
-
-        # ✅ Check if report has a source_code_url field
-        source_code_url = report.get("source_code_url")
-        afflicted_code_blobs = []
-
-        #If source code url is already in blob form
-        if source_code_url:
-            # Handle both string and list cases
-            urls_to_check = source_code_url if isinstance(source_code_url, list) else [source_code_url]
-
-            for url in urls_to_check:
-                if isinstance(url, str) and "github.com" in url and "/blob/" in url:
-                    afflicted_code_blobs.append(url)
-
-            if afflicted_code_blobs:
-                # Assign afflicted_github_code_blob and skip normal processing
-                report["afflicted_github_code_blob"] = afflicted_code_blobs
-                print("Source code is already github blob")
-                continue  # Skip the normal matching logic
-
-        # Process the individual report and get all github blobs
-        matched_files = process_single_report(
-            report, i, relevant_files_dict
-        )
-
-        #If no github source blob
-        if not matched_files:
-            continue
         
+        # Process report in-place
+        report = process_single_report(report, i, processed_urls, json_file)
+
+        if not report["afflicted_github_code_blob"]:
+            continue
+
         report_title = report.get('title', f'Report_{i+1}')
         report_id = report.get('id', f'ID_{i+1}')
 
-        # Store results
-        all_matches[report_title] = matched_files
-        
-        # Add to summary
+        all_matches[report_title] = report["afflicted_github_code_blob"]
+
+        # Add to summary using first blob for high-confidence
         summary_result = create_summary_result(
-            report_id, report_title, report, all_matches[report_title][0], 
+            report_id, report_title, report, report["afflicted_github_code_blob"]
         )
         summary_results.append(summary_result)
 
-        afflicted_code_blobs = []
-        for match in all_matches[report_title]:
-            afflicted_code_blobs.append(match.blob_url)
-        report["afflicted_github_code_blob"] = afflicted_code_blobs
-    
     # Save updated JSON
     save_updated_reports(json_file, reports)
-    
+
     # Print comprehensive summary
-    print_summary_header()
-    
     if summary_results:
-        # Print each result row
+        print_summary_header()
         for result in summary_results:
             print_summary_row(result)
-        
-        # Print statistics
         print_statistics(summary_results)
         print_severity_breakdown(summary_results)
         print_blob_assignment_summary(reports)
-        print_final_summary(all_matches)
-        
-    return all_matches  # Returns ONLY high confidence matches
+        #print_final_summary(all_matches)
 
-
+    return all_matches
 
 def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     
     # Use the CORRECT filename (note "copy.json" instead of ".json")
-    json_file = "/mnt/d/golden_dataset/bailsec/filtered_Bailsec - Defi Money Fee Module - Final Report.json"
+    json_file = "test_dataset/0xGuard/filtered_Anyrand.json"
     
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"

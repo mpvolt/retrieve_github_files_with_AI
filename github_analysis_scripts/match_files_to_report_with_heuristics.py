@@ -7,10 +7,9 @@ from pathlib import Path
 from typing import Dict, List, Set, Optional
 from fuzzywuzzy import fuzz
 from urllib.parse import quote
+from config import SMART_CONTRACT_EXTENSIONS
 
-SMART_CONTRACT_EXTENSIONS = (
-    '.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func', '.circom'
-)
+# Supported smart contract file extensions
 
 def search_github_for_code(code_snippet: str, repo_owner: str, repo_name: str, api_key: str) -> List[str]:
     """
