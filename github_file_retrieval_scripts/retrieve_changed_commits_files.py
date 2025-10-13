@@ -236,7 +236,7 @@ def parse_github_url(url):
     import re
     
     patterns = {
-        'commit': r'https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/commit/(?P<commit>[a-fA-F0-9]+)',
+        'commit': r'https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/commit/(?P<commit>[^/]+)',
         'pull': r'https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<pr>\d+)',
         'compare': r'https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/compare/(?P<base>[^#]+)\.\.\.(?P<head>[^#]+)',
         'tree': r'https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/tree/(?P<ref>.+)'
@@ -248,6 +248,7 @@ def parse_github_url(url):
             return url_type, match.groupdict()
     
     return None, None
+
 
 def handle_commit_files_via_api(github_url, search_terms=None):
     """

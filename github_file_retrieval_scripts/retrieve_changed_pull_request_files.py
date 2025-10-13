@@ -7,6 +7,7 @@ import tempfile
 import shutil
 from urllib.parse import urlparse, quote
 from pathlib import Path
+from config import SMART_CONTRACT_EXTENSIONS
 
 def parse_github_url(url):
     """Parse GitHub URL to extract owner, repo, and PR info"""
@@ -49,78 +50,92 @@ class GitCloneHandler:
     def __init__(self):
         self.temp_dir = None
         self.repo_path = None
+        self.api_handler = GitHubAPIHandler()  # Initialize API handler for fallback
     
     def clone_repo_for_pr(self, github_url, pr_number):
-        """Clone GitHub repository specifically for PR analysis with proper depth"""
+        """Clone GitHub repository specifically for PR analysis with fork support and head tree info."""
+        result_info = {
+            "success": False,
+            "repo_path": None,
+            "head_tree_info": None,
+        }
+
         try:
             url_type, url_parts = parse_github_url(github_url)
             if not url_parts:
                 print(f"Could not parse GitHub URL: {github_url}")
-                return False
-            
+                return result_info
+
             owner = url_parts['owner']
             repo = url_parts['repo']
-            clone_url = f"https://github.com/{owner}/{repo}.git"
-            
+            base_clone_url = f"https://github.com/{owner}/{repo}.git"
+
             self.temp_dir = tempfile.mkdtemp(prefix="github_analysis_")
             self.repo_path = os.path.join(self.temp_dir, repo)
-            
-            print(f"Cloning repository {owner}/{repo} for PR analysis...")
-            
-            cmd = ['git', 'clone', '--depth', '1', clone_url, self.repo_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            
-            if result.returncode != 0:
-                print(f"Git clone failed: {result.stderr}")
+            result_info["repo_path"] = self.repo_path
+
+            print(f"Cloning base repository {owner}/{repo}...")
+            clone_proc = subprocess.run(
+                ['git', 'clone', '--depth', '1', base_clone_url, self.repo_path],
+                capture_output=True, text=True
+            )
+            if clone_proc.returncode != 0:
+                print(f"Git clone failed: {clone_proc.stderr}")
                 self.cleanup()
-                return False
-            
+                return result_info
+
             os.chdir(self.repo_path)
-            
-            print(f"Fetching PR #{pr_number} with extended history...")
-            
-            pr_fetch_commands = [
-                ['git', 'fetch', 'origin', f'+refs/pull/{pr_number}/head:refs/remotes/origin/pr-{pr_number}'],
-                ['git', 'fetch', 'origin', f'+refs/pull/{pr_number}/merge:refs/remotes/origin/pr-{pr_number}-merge'],
-                ['git', 'fetch', '--depth=20', 'origin'],
-            ]
-            
-            pr_ref = None
-            for cmd in pr_fetch_commands:
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    if 'pr-' in cmd[-1]:
-                        pr_ref = cmd[-1].split(':')[-1]
-                    print(f"Successfully executed: {' '.join(cmd)}")
-                else:
-                    print(f"Command failed: {' '.join(cmd)} - {result.stderr}")
-            
-            if not pr_ref:
-                pr_ref = f'origin/pr-{pr_number}'
-            
-            verify_cmd = ['git', 'rev-parse', pr_ref]
-            verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-            
-            if verify_result.returncode == 0:
-                print(f"PR ref {pr_ref} is accessible")
-                return True
+
+            # --- Fetch PR details ---
+            pr_api = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+            pr_info = requests.get(pr_api).json()
+
+            if "message" in pr_info and "Not Found" in pr_info["message"]:
+                print(f"Could not fetch PR info from GitHub API: {pr_info}")
+                self.cleanup()
+                return result_info
+
+            head_repo_url = pr_info["head"]["repo"]["clone_url"]
+            head_ref = pr_info["head"]["ref"]
+            head_sha = pr_info["head"]["sha"]
+
+            print(f"PR #{pr_number} head repo: {head_repo_url}")
+            print(f"Branch: {head_ref}, Commit: {head_sha}")
+
+            # --- Fetch PR branch from fork or same repo ---
+            subprocess.run(['git', 'remote', 'add', 'prhead', head_repo_url], check=False)
+            fetch_proc = subprocess.run(['git', 'fetch', '--depth=20', 'prhead', head_ref],
+                                        capture_output=True, text=True)
+            if fetch_proc.returncode != 0:
+                print(f"PR fetch failed: {fetch_proc.stderr}")
+                self.cleanup()
+                return result_info
+
+            # --- Verify branch ---
+            verify_proc = subprocess.run(['git', 'rev-parse', f'prhead/{head_ref}'],
+                                        capture_output=True, text=True)
+            if verify_proc.returncode != 0:
+                print("Could not verify PR branch")
+                self.cleanup()
+                return result_info
+
+            # --- Get tree info for head commit ---
+            commit_api = f"https://api.github.com/repos/{owner}/{repo}/git/commits/{head_sha}"
+            head_commit_info = requests.get(commit_api).json()
+
+            if "tree" in head_commit_info:
+                result_info["head_tree_info"] = head_commit_info["tree"]["url"]
+                print(f"Head tree URL: {result_info['head_tree_info']}")
             else:
-                alt_pr_ref = f'remotes/origin/pr-{pr_number}'
-                alt_verify_cmd = ['git', 'rev-parse', alt_pr_ref]
-                alt_verify_result = subprocess.run(alt_verify_cmd, capture_output=True, text=True)
-                
-                if alt_verify_result.returncode == 0:
-                    print(f"Using alternative PR ref: {alt_pr_ref}")
-                    return True
-                else:
-                    print("Could not access PR with any ref format")
-                    self.cleanup()
-                    return False
-                    
+                print("Could not retrieve tree info from commit API")
+
+            result_info["success"] = True
+            return result_info
+
         except Exception as e:
-            print(f"Git clone error: {e}")
+            print(f"Error cloning PR: {e}")
             self.cleanup()
-            return False
+            return result_info
 
     def clone_repo(self, github_url, depth=20):
         """Legacy clone method - now redirects to the improved version"""
@@ -190,230 +205,224 @@ class GitCloneHandler:
         
         return earliest_commit_sha if earliest_commit_sha else base_sha
 
+    def get_blob_via_api_fallback(self, owner, repo, commit_sha, file_path, is_fork_head=False, fork_owner=None, fork_repo=None):
+        """Fallback to API when git show fails to retrieve a file"""
+        target_owner = fork_owner if is_fork_head and fork_owner else owner
+        target_repo = fork_repo if is_fork_head and fork_repo else repo
+        
+        print(f"  → API fallback: fetching {file_path} from {target_owner}/{target_repo}@{commit_sha[:8]}")
+        
+        content = self.api_handler.get_file_content_at_commit(
+            target_owner, target_repo, commit_sha, file_path
+        )
+        
+        if content:
+            print(f"  ✓ Successfully retrieved via API")
+        else:
+            print(f"  ✗ API fallback also failed")
+        
+        return content
+
     def get_pr_files_via_git(self, github_url, search_terms=None):
-        """Get PR files using git commands on cloned repository"""
+        """
+        Get all PR files using git commands on a cloned repository.
+        Handles PRs from forks and multiple commits with API fallback for missing files.
+        """
+        import subprocess
+        from urllib.parse import quote
+        import os
+
         url_type, url_parts = parse_github_url(github_url)
         if url_type != 'pull':
             print(f"This function handles pull request URLs. Got: {url_type}")
             return None
-        
+
         if not self.repo_path or not os.path.exists(self.repo_path):
             print("Repository not cloned or path doesn't exist")
             return None
-        
+
         try:
             owner = url_parts['owner']
             repo = url_parts['repo']
             pr_number = url_parts['pr']
             os.chdir(self.repo_path)
-            
-            pr_refs = [
-                f'remotes/origin/pr-{pr_number}',
-                f'origin/pr-{pr_number}',
-                f'pr-{pr_number}'
-            ]
-            
-            pr_ref = None
-            pr_head_sha = None
-            
-            for ref in pr_refs:
-                cmd = ['git', 'rev-parse', ref]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    pr_ref = ref
-                    pr_head_sha = result.stdout.strip()
-                    print(f"Found PR at {pr_ref}: {pr_head_sha[:8]}")
-                    break
-            
-            if not pr_ref:
-                print("PR reference not found, attempting to fetch...")
-                fetch_cmd = ['git', 'fetch', 'origin', f'pull/{pr_number}/head:pr-{pr_number}']
-                fetch_result = subprocess.run(fetch_cmd, capture_output=True, text=True)
-                
-                if fetch_result.returncode == 0:
-                    pr_ref = f'pr-{pr_number}'
-                    cmd = ['git', 'rev-parse', pr_ref]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        pr_head_sha = result.stdout.strip()
-                        print(f"Successfully fetched and found PR: {pr_head_sha[:8]}")
-                
-            if not pr_ref:
-                print("Could not find PR reference")
+
+            # --- Step 1: Get PR metadata (to detect forks) ---
+            print("Fetching PR metadata from GitHub API...")
+            pr_url = f"{self.api_handler.base_url}/repos/{owner}/{repo}/pulls/{pr_number}"
+            pr_response = self.api_handler.session.get(pr_url)
+
+            if pr_response.status_code != 200:
+                print(f"Failed to fetch PR metadata: {pr_response.text}")
                 return None
-            
-            base_sha = None
-            target_branch = None
-            base_branches = ['origin/main', 'origin/master', 'main', 'master']
-            
-            for base_branch in base_branches:
-                cmd = ['git', 'merge-base', pr_ref, base_branch]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    base_sha = result.stdout.strip()
-                    target_branch = base_branch
-                    print(f"Found base commit using {base_branch}: {base_sha[:8]}")
-                    break
-            
-            if not base_sha:
-                print("Merge-base failed, trying alternative methods...")
-                cmd = ['git', 'rev-parse', f'{pr_ref}^']
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    base_sha = result.stdout.strip()
-                    target_branch = 'main'
-                    print(f"Using first parent as base: {base_sha[:8]}")
-            
-            if not base_sha:
-                cmd = ['git', 'rev-parse', 'HEAD']
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    base_sha = result.stdout.strip()
-                    target_branch = 'main'
-                    print(f"Using HEAD as base (fallback): {base_sha[:8]}")
-            
-            if not base_sha:
-                print("Could not determine base commit")
-                return None
-            
-            print(f"Comparing {base_sha[:8]} -> {pr_head_sha[:8]}")
-            diff_cmd = ['git', 'diff', '--name-status', base_sha, pr_head_sha]
-            diff_result = subprocess.run(diff_cmd, capture_output=True, text=True)
-            
-            if diff_result.returncode != 0:
-                print(f"Diff command failed: {diff_result.stderr}")
-                alt_diff_cmd = ['git', 'show', '--name-status', '--format=', pr_head_sha]
-                alt_diff_result = subprocess.run(alt_diff_cmd, capture_output=True, text=True)
-                if alt_diff_result.returncode == 0:
-                    print("Using alternative diff method (git show)")
-                    diff_output = alt_diff_result.stdout
-                else:
-                    print(f"Alternative diff also failed: {alt_diff_result.stderr}")
-                    return None
+
+            pr_data = pr_response.json()
+            head_repo = pr_data["head"].get("repo")
+            head_ref = pr_data["head"]["ref"]
+            head_sha = pr_data["head"]["sha"]
+            base_sha = pr_data["base"]["sha"]
+            base_ref = pr_data["base"]["ref"]
+
+            # Detect fork origin
+            fork_owner = None
+            fork_repo = None
+            head_clone_url = None
+            is_fork = False
+
+            if head_repo:
+                fork_owner = head_repo["owner"]["login"]
+                fork_repo = head_repo["name"]
+                head_clone_url = head_repo["clone_url"]
+                is_fork = (fork_owner != owner) or (fork_repo != repo)
+
+            if is_fork:
+                print(f"Detected fork PR from {fork_owner}/{fork_repo}")
             else:
-                diff_output = diff_result.stdout
-            
-            print(f"Diff output:\n{diff_output}")
-            
-            if not diff_output.strip():
-                print("No changes found in diff")
+                print("PR is from same repository.")
+
+            # --- Step 2: Fetch PR branch ---
+            pr_ref = f"pr-{pr_number}"
+            if is_fork:
+                # Add fork as remote if missing
+                subprocess.run(["git", "remote", "add", "prhead", head_clone_url], check=False)
+                fetch_cmd = ["git", "fetch", "--depth=20", "prhead", head_ref]
+            else:
+                fetch_cmd = ["git", "fetch", "origin", f"pull/{pr_number}/head:{pr_ref}"]
+
+            fetch_result = subprocess.run(fetch_cmd, capture_output=True, text=True)
+            if fetch_result.returncode != 0:
+                print(f"Fetch failed: {fetch_result.stderr}")
                 return None
-            
+
+            # Verify PR head SHA
+            verify_cmd = ["git", "rev-parse", f"FETCH_HEAD"]
+            verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
+            if verify_result.returncode == 0:
+                pr_head_sha = verify_result.stdout.strip()
+            else:
+                pr_head_sha = head_sha
+
+            print(f"PR head SHA: {pr_head_sha[:8]}")
+            print(f"Base SHA: {base_sha[:8]} ({base_ref})")
+
+            # --- Step 3: Diff to get changed files ---
+            diff_cmd = ["git", "diff", "--name-status", f"{base_sha}..{pr_head_sha}"]
+            diff_result = subprocess.run(diff_cmd, capture_output=True, text=True)
+            if diff_result.returncode != 0:
+                print(f"Diff failed: {diff_result.stderr}")
+                return None
+            diff_output = diff_result.stdout.strip()
+            if not diff_output:
+                print("No files changed in this PR.")
+                return None
+
             changed_files = []
-            smart_contract_extensions = ('.sol', '.tsol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
-            
-            for line in diff_output.strip().split('\n'):
+
+            for line in diff_output.splitlines():
                 if not line:
                     continue
-                    
+
                 parts = line.split('\t')
                 if len(parts) < 2:
                     continue
-                
+
                 status_char = parts[0][0]
                 filename = parts[1]
                 previous_filename = parts[2] if len(parts) > 2 else filename
-                
-                status_map = {
-                    'A': 'added',
-                    'D': 'removed', 
-                    'M': 'modified',
-                    'R': 'renamed',
-                    'C': 'copied'
-                }
+
+                status_map = {'A': 'added', 'D': 'removed', 'M': 'modified', 'R': 'renamed', 'C': 'copied'}
                 status = status_map.get(status_char, 'modified')
-                
-                print(f"Processing file: {filename} (status: {status})")
-                
-                if filename.endswith(smart_contract_extensions):
-                    old_blob = None
-                    old_blob_sha = ""
-                    
-                    if status != 'added':
-                        old_content_cmd = ['git', 'show', f'{base_sha}:{previous_filename}']
-                        old_content_result = subprocess.run(old_content_cmd, capture_output=True, text=True)
-                        
-                        if old_content_result.returncode == 0:
-                            old_blob = old_content_result.stdout
-                            print(f"Retrieved old blob for {previous_filename}: {len(old_blob)} chars")
-                            
-                            old_blob_cmd = ['git', 'rev-parse', f'{base_sha}:{previous_filename}']
-                            old_blob_result = subprocess.run(old_blob_cmd, capture_output=True, text=True)
-                            if old_blob_result.returncode == 0:
-                                old_blob_sha = old_blob_result.stdout.strip()
-                        else:
-                            print(f"Could not get old blob: {old_content_result.stderr}")
-                    
-                    new_blob = None
-                    new_blob_sha = ""
-                    
-                    if status != 'removed':
-                        new_content_cmd = ['git', 'show', f'{pr_head_sha}:{filename}']
-                        new_content_result = subprocess.run(new_content_cmd, capture_output=True, text=True)
-                        
-                        if new_content_result.returncode == 0:
-                            new_blob = new_content_result.stdout
-                            print(f"Retrieved new blob for {filename}: {len(new_blob)} chars")
-                            
-                            new_blob_cmd = ['git', 'rev-parse', f'{pr_head_sha}:{filename}']
-                            new_blob_result = subprocess.run(new_blob_cmd, capture_output=True, text=True)
-                            if new_blob_result.returncode == 0:
-                                new_blob_sha = new_blob_result.stdout.strip()
-                        else:
-                            print(f"Could not get new blob: {new_content_result.stderr}")
-                    
-                    file_info = {
-                        'file_path': filename,
-                        'previous_file_path': previous_filename,
-                        'status': status,
-                        'old_blob': old_blob,
-                        'new_blob': new_blob,
-                        'old_blob_sha': old_blob_sha,
-                        'new_blob_sha': new_blob_sha,
-                        'old_blob_url': f"https://github.com/{owner}/{repo}/blob/{base_sha}/{quote(previous_filename)}" if status != 'added' else '',
-                        'new_blob_url': f"https://github.com/{owner}/{repo}/blob/{pr_head_sha}/{quote(filename)}" if status != 'removed' else '',
-                        'score': 100
-                    }
-                    
-                    if search_terms:
-                        patch_cmd = ['git', 'diff', base_sha, pr_head_sha, '--', filename]
-                        patch_result = subprocess.run(patch_cmd, capture_output=True, text=True)
-                        patch_content = patch_result.stdout if patch_result.returncode == 0 else ''
-                        
-                        score = calculate_relevance_score(filename, patch_content, search_terms)
-                        file_info['score'] = score
-                        
-                        if score > 0:
-                            changed_files.append(file_info)
+
+                if not filename.endswith(SMART_CONTRACT_EXTENSIONS):
+                    continue
+
+                old_blob = None
+                new_blob = None
+                old_blob_sha = ""
+                new_blob_sha = ""
+
+                # --- Get old blob (base) ---
+                if status != 'added':
+                    old_result = subprocess.run(['git', 'show', f'{base_sha}:{previous_filename}'],
+                                                capture_output=True, text=True)
+                    if old_result.returncode == 0:
+                        old_blob = old_result.stdout
+                        old_blob_sha = subprocess.run(['git', 'rev-parse', f'{base_sha}:{previous_filename}'],
+                                                    capture_output=True, text=True).stdout.strip()
                     else:
-                        changed_files.append(file_info)
-                    
-                    print(f"Added {filename} to results")
-            
+                        print(f"Fallback: fetching old blob for {previous_filename} via API...")
+                        old_blob = self.get_blob_via_api_fallback(owner, repo, base_sha, previous_filename)
+
+                # --- Get new blob (head) ---
+                if status != 'removed':
+                    new_result = subprocess.run(['git', 'show', f'{pr_head_sha}:{filename}'],
+                                                capture_output=True, text=True)
+                    if new_result.returncode == 0:
+                        new_blob = new_result.stdout
+                        new_blob_sha = subprocess.run(['git', 'rev-parse', f'{pr_head_sha}:{filename}'],
+                                                    capture_output=True, text=True).stdout.strip()
+                    else:
+                        print(f"Fallback: fetching new blob for {filename} via API...")
+                        new_blob = self.get_blob_via_api_fallback(
+                            fork_owner if is_fork else owner,
+                            fork_repo if is_fork else repo,
+                            pr_head_sha,
+                            filename,
+                            is_fork_head=is_fork,
+                            fork_owner=fork_owner,
+                            fork_repo=fork_repo
+                        )
+
+                new_blob_owner = fork_owner if is_fork else owner
+                new_blob_repo = fork_repo if is_fork else repo
+
+                file_info = {
+                    'file_path': filename,
+                    'previous_file_path': previous_filename,
+                    'status': status,
+                    'old_blob': old_blob,
+                    'new_blob': new_blob,
+                    'old_blob_sha': old_blob_sha,
+                    'new_blob_sha': new_blob_sha,
+                    'old_blob_url': f"https://github.com/{owner}/{repo}/blob/{base_sha}/{quote(previous_filename)}" if old_blob else '',
+                    'new_blob_url': f"https://github.com/{new_blob_owner}/{new_blob_repo}/blob/{pr_head_sha}/{quote(filename)}" if new_blob else '',
+                    'retrieved_via_api': (old_blob is None and status != 'added') or (new_blob is None and status != 'removed')
+                }
+
+                changed_files.append(file_info)
+                retrieval_method = "API" if file_info['retrieved_via_api'] else "git"
+                print(f"Added {filename} (status: {status}, method: {retrieval_method})")
+
+            print(f"\nTotal files collected: {len(changed_files)}")
+
+            # --- Step 4: Optional earliest commit detection ---
             earliest_commit_sha = self.find_earliest_commit_for_files_git(changed_files, base_sha)
-            
-            print(f"Found {len(changed_files)} smart contract files")
-            
-            owner = url_parts['owner']
-            repo = url_parts['repo']
-            clean_target_branch = target_branch.replace('origin/', '') if target_branch else 'main'
-            
+            clean_target_branch = base_ref or "main"
+
+            # --- Step 5: Return full info including head tree URL ---
+            commit_api = f"https://api.github.com/repos/{fork_owner if is_fork else owner}/{fork_repo if is_fork else repo}/git/commits/{pr_head_sha}"
+            commit_info = self.api_handler.session.get(commit_api).json()
+            head_tree_url = commit_info.get("tree", {}).get("url")
+
             return {
                 'pr_number': pr_number,
                 'files': changed_files,
-                'earliest_tree_url': f"https://github.com/{owner}/{repo}/tree/{earliest_commit_sha}",
-                'merged_target_tree_url': f"https://github.com/{owner}/{repo}/tree/{clean_target_branch}",
                 'base_commit_sha': base_sha,
                 'head_commit_sha': pr_head_sha,
                 'earliest_commit_sha': earliest_commit_sha,
-                'target_branch': clean_target_branch
+                'target_branch': clean_target_branch,
+                'head_tree_info': head_tree_url,
+                'earliest_tree_url': f"https://github.com/{owner}/{repo}/tree/{earliest_commit_sha}",
+                'merged_target_tree_url': f"https://github.com/{owner}/{repo}/tree/{clean_target_branch}"
             }
-            
+
         except Exception as e:
             print(f"Error processing PR via git: {e}")
             import traceback
             traceback.print_exc()
             return None
+
+
     
     def cleanup(self):
         """Clean up temporary directory"""
@@ -535,85 +544,90 @@ class GitHubAPIHandler:
         return earliest_commit['sha'] if earliest_commit else base_sha
 
     def get_pr_files(self, owner, repo, pr_number):
-        """Get list of changed files in a pull request via GitHub API"""
+        """Get all changed files in a pull request via GitHub API, including forked PRs and deleted branches"""
+        # Check API rate limit
         if not self.check_rate_limit():
-            print("Rate limit exceeded!")
-            time.sleep(300)
+            time.sleep(5)
             return self.get_pr_files(owner, repo, pr_number)
-            
+
+        # Step 1: Fetch PR details
         pr_url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_number}"
-        try:
-            pr_response = self.session.get(pr_url)
-            
-            if pr_response.status_code != 200:
-                print(f"Failed to fetch PR details: {pr_response.status_code}")
-                return None
-                
-            pr_data = pr_response.json()
-            base_ref = pr_data['base']['ref']
-            head_ref = pr_data['head']['ref']
-            base_sha = pr_data['base']['sha']
-            head_sha = pr_data['head']['sha']
-            
-            files_url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_number}/files"
-            files_response = self.session.get(files_url)
-            
-            if files_response.status_code == 200:
-                files_data = files_response.json()
-                
-                changed_files_info = []
-                smart_contract_extensions = ('.sol', '.vy', '.rs', '.move', '.cairo', '.fc', '.func')
-                
-                for file_info in files_data:
-                    filename = file_info['filename']
-                    status = file_info['status']
-                    
-                    if filename.endswith(smart_contract_extensions):
-                        previous_filename = file_info.get('previous_filename', filename)
-                        
-                        old_blob = None
-                        if status != 'added':
-                            old_blob = self.get_file_content_at_commit(owner, repo, base_sha, previous_filename)
-                        
-                        new_blob = None
-                        if status != 'removed':
-                            new_blob = self.get_file_content_at_commit(owner, repo, head_sha, filename)
-                        
-                        file_data = {
-                            'file_path': filename,
-                            'previous_file_path': previous_filename,
-                            'status': status,
-                            'old_blob': old_blob,
-                            'new_blob': new_blob,
-                            'old_blob_sha': '',
-                            'new_blob_sha': '',
-                            'old_blob_url': f"https://github.com/{owner}/{repo}/blob/{base_sha}/{quote(previous_filename)}" if status != 'added' else '',
-                            'new_blob_url': f"https://github.com/{owner}/{repo}/blob/{head_sha}/{quote(filename)}" if status != 'removed' else '',
-                            'score': 100
-                        }
-                        
-                        changed_files_info.append(file_data)
-                
-                earliest_commit_sha = self.find_earliest_commit_for_files(owner, repo, changed_files_info, base_sha)
-                
-                return {
-                    'pr_number': pr_number,
-                    'files': changed_files_info,
-                    'earliest_tree_url': f"https://github.com/{owner}/{repo}/tree/{earliest_commit_sha}",
-                    'merged_target_tree_url': f"https://github.com/{owner}/{repo}/tree/{base_ref}",
-                    'base_commit_sha': base_sha,
-                    'head_commit_sha': head_sha,
-                    'earliest_commit_sha': earliest_commit_sha,
-                    'target_branch': base_ref
-                }
-                
-            else:
-                print(f"API request failed: {files_response.status_code}")
-                return None
-                
-        except Exception as e:
-            print(f"Error fetching PR files: {e}")
+        pr_response = self.session.get(pr_url)
+        if pr_response.status_code != 200:
+            print(f"Failed to fetch PR details: {pr_response.status_code}")
             return None
+
+        pr_data = pr_response.json()
+        base_sha = pr_data['base']['sha']
+        head_sha = pr_data['head']['sha']
+        base_ref = pr_data['base']['ref']
+
+        # Determine head repo (fork-safe)
+        head_repo = pr_data['head'].get('repo')
+        head_owner = head_repo['owner']['login'] if head_repo else owner
+        head_repo_name = head_repo['name'] if head_repo else repo
+
+        # Step 2: Fetch all changed files via pagination
+        files_url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_number}/files"
+        all_files = []
+        page = 1
+
+        while True:
+            files_response = self.session.get(files_url, params={'page': page, 'per_page': 100})
+            if files_response.status_code != 200:
+                print(f"Failed to fetch PR files: {files_response.status_code}")
+                break
+
+            files_data = files_response.json()
+            if not files_data:
+                break
+
+            for file_info in files_data:
+                filename = file_info['filename']
+                if not filename.endswith(SMART_CONTRACT_EXTENSIONS):
+                    continue
+
+                previous_filename = file_info.get('previous_filename', filename)
+                status = file_info['status']
+
+                # Step 3: Fetch old file content (from base repo/commit)
+                old_blob = None
+                if status != 'added':
+                    old_blob = self.get_file_content_at_commit(owner, repo, base_sha, previous_filename)
+
+                # Step 4: Fetch new file content (from head repo/commit, fork-safe)
+                new_blob = None
+                if status != 'removed':
+                    new_blob = self.get_file_content_at_commit(head_owner, head_repo_name, head_sha, filename)
+
+                all_files.append({
+                    'file_path': filename,
+                    'previous_file_path': previous_filename,
+                    'status': status,
+                    'old_blob': old_blob,
+                    'new_blob': new_blob,
+                    'old_blob_url': f"https://github.com/{owner}/{repo}/blob/{base_sha}/{quote(previous_filename)}" if old_blob else '',
+                    'new_blob_url': f"https://github.com/{head_owner}/{head_repo_name}/blob/{head_sha}/{quote(filename)}" if new_blob else '',
+                    'score': 100
+                })
+
+            page += 1
+
+        # Step 5: Determine earliest commit containing any of the files
+        earliest_commit_sha = self.find_earliest_commit_for_files(owner, repo, all_files, base_sha)
+
+        return {
+            'pr_number': pr_number,
+            'files': all_files,
+            'earliest_tree_url': f"https://github.com/{owner}/{repo}/tree/{earliest_commit_sha}",
+            'merged_target_tree_url': f"https://github.com/{owner}/{repo}/tree/{base_ref}",
+            'base_commit_sha': base_sha,
+            'head_commit_sha': head_sha,
+            'earliest_commit_sha': earliest_commit_sha,
+            'target_branch': base_ref
+        }
+
+
 
 def handle_pr_files_via_git_clone(github_url, search_terms=None):
     """Handle pull request files using git clone approach with fallback to API"""
@@ -622,6 +636,7 @@ def handle_pr_files_via_git_clone(github_url, search_terms=None):
     git_handler = GitCloneHandler()
     
     try:
+        result = git_handler.clone_repo(github_url)
         if git_handler.clone_repo(github_url):
             result = git_handler.get_pr_files_via_git(github_url, search_terms)
             if result:
@@ -649,26 +664,40 @@ def handle_pr_files_via_git_clone(github_url, search_terms=None):
     
     api = GitHubAPIHandler()
     result = api.get_pr_files(owner, repo, pr_number)
-    
+
     if not result:
         print("Could not retrieve pull request information")
         return None, None
-    
+
+    # --- Add head_tree_url automatically ---
+    if 'head_commit_sha' in result:
+        repo_url = f"https://github.com/{owner}/{repo}"
+        result['head_tree_info'] = f"{repo_url}/tree/{result['head_commit_sha']}"
+        print(f"Added head_tree_url: {result['head_tree_info']}")
+    else:
+        print("Warning: head_commit_sha missing, could not set head_tree_url")
+
+    # --- Optional filtering by search terms ---
     if search_terms:
         filtered_files = []
         for file_info in result['files']:
+            # Use empty string for patch_content since we're just filtering by filename
             score = calculate_relevance_score(file_info['file_path'], '', search_terms)
             if score > 0:
                 file_info['score'] = score
                 filtered_files.append(file_info)
         result['files'] = filtered_files
-    
+        print(f"Filtered to {len(filtered_files)} files based on search terms")
+
     print("Successfully processed PR using GitHub API method")
+
     return result, None
+
 
 def handle_pr_files_via_api(github_url, search_terms=None):
     """Handle pull request files using GitHub API with git fallback"""
     result, git_handler = handle_pr_files_via_git_clone(github_url, search_terms)
+    #print(result)
     
     if git_handler:
         git_handler.cleanup()

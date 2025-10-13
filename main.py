@@ -126,6 +126,7 @@ def process_single_json_file(json_file_str: str, rate_manager, max_retries=3):
 
                 #Convert github source/fix links into github blobs
                 success = analyze_relevant_files(json_file_str)
+                
 
                 #Retrieve relevant code context from github blobs to train AI
                 # github_source_code_analyzer = GitHubCodeAnalyzer(GITHUB_API_KEY, OPENAI_API_KEY)
@@ -194,19 +195,12 @@ def process_json_files_with_rate_limiting_parallel():
                     processed_count += 1
                 else:
                     failed_files.add(file_path)
+                
             except Exception as e:
                 logger.error(f"Unhandled exception processing {json_file}: {e}")
                 failed_files.add(json_file)
 
     logger.info(f"Processing complete: {processed_count} successful, {len(failed_files)} failed")
-
-    error_file = Path("errors.txt").resolve()
-
-    # Ensure parent directory exists
-    error_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with error_file.open("w", encoding="utf-8") as f:
-        f.write("\n".join(failed_files))
 
 def main():
     """Entry point for the script"""

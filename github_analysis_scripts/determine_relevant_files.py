@@ -3,6 +3,7 @@
 import json
 import os
 import requests
+from typing import Set
 from github_file_retrieval_scripts.retrieve_all_smart_contract_files import get_smart_contracts
 from github_file_retrieval_scripts.retrieve_changed_commits_files import handle_commit_files_via_api
 from github_file_retrieval_scripts.retrieve_changed_pull_request_files import handle_pr_files_via_api
@@ -175,15 +176,9 @@ def load_reports_from_json(json_file: str) -> List[Dict[str, Any]]:
 def validate_report_urls(report: Dict[str, Any], json_file: str) -> Tuple[List[str], List[str]]:
     """
     Extract and validate source and fix URLs from a report.
-    Returns URLs that have matching words with the json_file name.
-    If no URLs match, returns all URLs.
-    
-    Args:
-        report: Report dictionary containing URL fields
-        json_file: Name of the JSON file to match against
-        
-    Returns:
-        Tuple of (source_urls, fix_urls) as lists
+    Only extracts URLs that have words similar to the filename, otherwise returns all URLs
+    Example: midas-report-2023.json <=> https://github.com/RedDuck-Software/midas-contracts/pull/66
+    Removes parentheses from URLs before matching.
     """
     source_url = report.get("source_code_url")
     fix_url = report.get("fix_commit_url")
@@ -191,7 +186,11 @@ def validate_report_urls(report: Dict[str, Any], json_file: str) -> Tuple[List[s
     # Convert to lists for uniform processing
     all_source_urls = source_url if isinstance(source_url, list) else [source_url] if source_url else []
     all_fix_urls = fix_url if isinstance(fix_url, list) else [fix_url] if fix_url else []
-    
+
+    # Remove parentheses characters from URLs
+    all_source_urls = [re.sub(r"[()]", "", url) for url in all_source_urls]
+    all_fix_urls = [re.sub(r"[()]", "", url) for url in all_fix_urls]
+
     # Filter source URLs by matching words
     matching_source_urls = [url for url in all_source_urls if has_matching_words(json_file, url)]
     
@@ -220,6 +219,47 @@ def extract_search_data(report: Dict[str, Any]) -> str:
     search_data = {field: report[field] for field in search_fields if field in report}
     return json.dumps(search_data)
 
+def blob_to_tree_url(blob_url):
+    """
+    Convert a GitHub blob/tree URL into the base tree URL (ending at the branch/commit).
+
+    Example:
+        Input:  https://github.com/sherlock-audit/2024-08-midas-minter-redeemer/blob/main/midas-contracts/contracts/access/Pausable.sol
+        Output: https://github.com/sherlock-audit/2024-08-midas-minter-redeemer/tree/main/
+        
+        Input:  https://github.com/G7DAO/achievo-contracts/blob/44fcac04069938ae1177560c40bafff6fd61f7e3/contracts/soulbounds/LootDrop.sol
+        Output: https://github.com/G7DAO/achievo-contracts/tree/44fcac04069938ae1177560c40bafff6fd61f7e3/
+    """
+    match = re.match(r'(https://github\.com/[^/]+/[^/]+)/(blob|tree)/([^/]+)(?:/.*)?', blob_url)
+    if not match:
+        raise ValueError(f"Invalid GitHub blob/tree URL: {blob_url}")
+    owner_repo, _, ref = match.groups()
+    return f"{owner_repo}/tree/{ref}/"
+
+def tree_to_commit_url(tree_url):
+    """
+    Convert a GitHub tree URL into its corresponding commit URL.
+    Example:
+      tree -> https://github.com/org/repo/tree/<sha>/path/to/dir
+      commit -> https://github.com/org/repo/commit/<sha>
+    """
+    parsed = urlparse(tree_url)
+    parts = parsed.path.strip('/').split('/')
+    
+    # Find index of 'tree' segment
+    try:
+        tree_index = parts.index('tree')
+    except ValueError:
+        raise ValueError("Not a valid GitHub tree URL")
+    
+    # Extract repo path before 'tree' and the SHA
+    base_path = '/'.join(parts[:tree_index])  # org/repo
+    sha = parts[tree_index + 1]
+    
+    # Construct commit URL (ignoring any path after SHA)
+    new_path = f"/{base_path}/commit/{sha}"
+    
+    return f"{parsed.scheme}://{parsed.netloc}{new_path}"
 
 def process_source_url(source_url: str) -> Set[str]:
     """
@@ -232,41 +272,65 @@ def process_source_url(source_url: str) -> Set[str]:
         All smart contract files in the source repo
     """
     relevant_files_set = set()
-    
+
     print(f"\nSearching source code at: {source_url}")
     new_tree = None
-    
-    if 'commit' in source_url:
-        print("Processing commit url, retrieving new tree and relevant smart contract files")
-        result = handle_commit_files_via_api(source_url)
-        new_tree = result['newer_tree_url']
+    result = None
 
-    elif 'pull' in source_url:
-        print("Processing pull url, retrieving new tree and relevant smart contract files")
-        result = handle_pr_files_via_api(source_url)
-        new_tree = result['head_tree_info']
+    try:
+        if 'commit' in source_url:
+            print("Processing commit URL, retrieving new tree and relevant smart contract files")
+            result = handle_commit_files_via_api(source_url)
+            if result and 'newer_tree_url' in result:
+                new_tree = result['newer_tree_url']
+            else:
+                print("⚠️ Warning: handle_commit_files_via_api() returned None or missing 'newer_tree_url'")
 
-    elif 'compare' in source_url:
-        print("Processing compare url, retrieving new tree and relevant smart contract files")
-        result = handle_compare_files_via_api(source_url)
-        new_tree = result['head_tree_url']
+        elif 'pull' in source_url:
+            print("Processing pull URL, retrieving new tree and relevant smart contract files")
+            result = handle_pr_files_via_api(source_url)
+            if result and 'head_tree_info' in result:
+                new_tree = result['head_tree_info']
+            else:
+                print("⚠️ Warning: handle_pr_files_via_api() returned None or missing 'head_tree_info'")
 
-    elif 'tree' in source_url:
-        print("Already a tree, retrieving smart contract files")
-        new_tree = source_url
+        elif 'compare' in source_url:
+            print("Processing compare URL, retrieving new tree and relevant smart contract files")
+            result = handle_compare_files_via_api(source_url)
+            if result and 'head_tree_url' in result:
+                new_tree = result['head_tree_url']
+            else:
+                print("⚠️ Warning: handle_compare_files_via_api() returned None or missing 'head_tree_url'")
 
-    elif 'blob' in source_url:
-        print("Blob detected, doing nothing")
-        relevant_files_set.add(source_url)
+        elif 'tree' in source_url:
+            print("Already a tree, retrieving smart contract files")
+            new_tree = source_url
 
-    if new_tree:
-        # Get all smart contract files and check semantics
-        results = get_smart_contracts(github_url=new_tree, api_key=API_KEY)
-        for file in results['files']:
-            relevant_files_set.add(file['blob_url'])
-    
-    return relevant_files_set
+        elif 'blob' in source_url:
+            print("Blob detected, converting to tree")
+            new_tree = blob_to_tree_url(source_url)
 
+        if new_tree:
+            print(f"Fetching smart contracts from: {new_tree}")
+            results = get_smart_contracts(github_url=new_tree, api_key=API_KEY)
+
+            if not results or 'files' not in results:
+                print("⚠️ Warning: get_smart_contracts() returned None or missing 'files'")
+                return relevant_files_set
+
+            for file in results['files']:
+                if isinstance(file, dict) and 'blob_url' in file:
+                    relevant_files_set.add(file['blob_url'])
+                else:
+                    print(f"⚠️ Skipping malformed file entry: {file}")
+
+        else:
+            print("⚠️ Warning: new_tree could not be determined for this URL")
+
+    except Exception as e:
+        print(f"❌ Error processing source_url {source_url}: {e}")
+
+    return list(relevant_files_set)
 
 def process_fix_url(fix_url: str, changed_files_only: bool) -> Set[str]:
     """
@@ -283,57 +347,118 @@ def process_fix_url(fix_url: str, changed_files_only: bool) -> Set[str]:
     """
     relevant_files_set = set()
     github_tree_url = ""
-    
-    
+
     print(f"\nSearching fix commit at: {fix_url}")
-    
-    if 'commit' in fix_url:
-        print("Processing commit url, retrieving changed files")
-        result = handle_commit_files_via_api(fix_url)
-        for file_info in result['files']:
-            relevant_files_set.add(file_info['older_file_url'])
-        github_tree_url = result['older_tree_url']
 
-    elif 'pull' in fix_url:
-        print("Processing pull url, retrieving changed files")
-        result = handle_pr_files_via_api(fix_url)
-        for file_info in result['files']:
-            relevant_files_set.add(file_info['old_blob_url'])
-        github_tree_url = result['earliest_tree_url']
+    try:
+        result = None
 
-    elif 'compare' in fix_url:
-        print("Processing compare url, retrieving changed files")
-        result = handle_compare_files_via_api(fix_url)
-        for file_info in result['files']:
-            relevant_files_set.add(file_info['older_file_url'])
-        github_tree_url = result['base_tree_url']
-        
-    elif 'tree' in fix_url:
-        print("Processing tree url, relevant smart contract files")
-        fix_url = fix_url.replace("/tree/", "/commit/")
-        result = handle_commit_files_via_api(fix_url)
-        for file_info in result['files']:
-            relevant_files_set.add(file_info['older_file_url'])
-        github_tree_url = result['older_tree_url']
-    
-    elif 'blob' in fix_url:
-        fix_url = fix_url.replace("/blob/", "/commit/")
-        result = handle_commit_files_via_api(fix_url)
-        for file_info in result['files']:
-            relevant_files_set.add(file_info['older_file_url'])
-        github_tree_url = result['older_tree_url']
+        if 'commit' in fix_url:
+            print("Processing commit URL, retrieving changed files")
+            result = handle_commit_files_via_api(fix_url)
+            if result and 'files' in result:
+                for file_info in result['files']:
+                    if isinstance(file_info, dict) and 'older_file_url' in file_info:
+                        relevant_files_set.add(file_info['older_file_url'])
+                    else:
+                        print(f"⚠️ Skipping malformed file entry: {file_info}")
+                github_tree_url = result.get('older_tree_url', "")
+            else:
+                print("⚠️ Warning: handle_commit_files_via_api() returned None or missing 'files'")
 
-    all_files = set()
+        elif 'pull' in fix_url:
+            print("Processing pull URL, retrieving changed files")
+            result = handle_pr_files_via_api(fix_url)
+            if result and 'files' in result:
+                for file_info in result['files']:
+                    if isinstance(file_info, dict):
+                        # Add old version URL if it exists (for modified/removed/renamed files)
+                        if file_info.get('old_blob_url'):
+                            relevant_files_set.add(file_info['old_blob_url'])
+                        # Add new version URL if it exists (for added/modified/renamed files)
+                        if file_info.get('new_blob_url'):
+                            relevant_files_set.add(file_info['new_blob_url'])
+                        # If neither URL exists, warn
+                        if not file_info.get('old_blob_url') and not file_info.get('new_blob_url'):
+                            print(f"⚠️ Skipping file entry with no URLs: {file_info.get('file_path', 'unknown')}")
+                    else:
+                        print(f"⚠️ Skipping malformed file entry: {file_info}")
+                github_tree_url = result.get('earliest_tree_url', "")
+            else:
+                print("⚠️ Warning: handle_pr_files_via_api() returned None or missing 'files'")
 
-    if github_tree_url and not changed_files_only:
-        # Get all smart contract files and check semantics
-        results = get_smart_contracts(github_url=github_tree_url, api_key=API_KEY)
-        for file in results['files']:
-            all_files.add(file['blob_url'])
-        return all_files
+        elif 'compare' in fix_url:
+            print("Processing compare URL, retrieving changed files")
+            result = handle_compare_files_via_api(fix_url)
+            if result and 'files' in result:
+                for file_info in result['files']:
+                    if isinstance(file_info, dict) and 'older_file_url' in file_info:
+                        relevant_files_set.add(file_info['older_file_url'])
+                    else:
+                        print(f"⚠️ Skipping malformed file entry: {file_info}")
+                github_tree_url = result.get('base_tree_url', "")
+            else:
+                print("⚠️ Warning: handle_compare_files_via_api() returned None or missing 'files'")
 
-    else:
-        return relevant_files_set        
+        elif 'tree' in fix_url:
+            print("Processing tree URL, retrieving smart contract files")
+            adjusted_url = normalize_commit_url(fix_url)
+            result = handle_commit_files_via_api(adjusted_url)
+            if result and 'files' in result:
+                for file_info in result['files']:
+                    if isinstance(file_info, dict) and 'older_file_url' in file_info:
+                        relevant_files_set.add(file_info['older_file_url'])
+                    else:
+                        print(f"⚠️ Skipping malformed file entry: {file_info}")
+                github_tree_url = result.get('older_tree_url', "")
+            else:
+                print("⚠️ Warning: handle_commit_files_via_api() returned None or missing 'files'")
+
+        elif 'blob' in fix_url:
+            print("Processing blob URL, converting to tree")
+            tree_conversion = blob_to_tree_url(fix_url)
+            adjusted_url = tree_to_commit_url(tree_conversion)
+            print(adjusted_url)
+            result = handle_commit_files_via_api(adjusted_url)
+            if result and 'files' in result:
+                for file_info in result['files']:
+                    if isinstance(file_info, dict) and 'older_file_url' in file_info:
+                        relevant_files_set.add(file_info['older_file_url'])
+                    else:
+                        print(f"⚠️ Skipping malformed file entry: {file_info}")
+                github_tree_url = result.get('older_tree_url', "")
+            else:
+                print("⚠️ Warning: handle_commit_files_via_api() returned None or missing 'files'")
+
+        else:
+            print("⚠️ Warning: Unrecognized URL format, skipping")
+
+        all_files = set()
+
+        if github_tree_url and not changed_files_only:
+            print(f"Fetching all smart contract files from: {github_tree_url}")
+            results = get_smart_contracts(github_url=github_tree_url, api_key=API_KEY)
+
+            if not results or 'files' not in results:
+                print("⚠️ Warning: get_smart_contracts() returned None or missing 'files'")
+                return relevant_files_set
+
+            for file in results['files']:
+                if isinstance(file, dict) and 'blob_url' in file:
+                    all_files.add(file['blob_url'])
+                else:
+                    print(f"⚠️ Skipping malformed file entry: {file}")
+
+            return all_files
+
+        else:
+            if not github_tree_url:
+                print("⚠️ Warning: github_tree_url could not be determined")
+            return list(relevant_files_set)
+
+    except Exception as e:
+        print(f"❌ Error processing fix_url {fix_url}: {e}")
+        return list(relevant_files_set)        
 
 GITHUB_API = "https://api.github.com"
 
@@ -593,60 +718,116 @@ def get_newest_github_url(urls: list) -> list:
         return urls
 
 
-def determine_relevant_files(report: Dict[str, Any], report_index: int, processed_urls: Dict[str, List[str]], json_file: str) -> Tuple[str, List[str]]:
+def determine_relevant_files(
+    report: Dict[str, Any],
+    report_index: int,
+    processed_urls: Dict[str, List[str]],
+    json_file: str
+) -> Tuple[List[str], str]:
     """
     Process a single report to extract relevant files.
     """
-    # Validate URLs
     source_urls, fix_urls = validate_report_urls(report, json_file)
     print(f"Source Urls: {source_urls}")
     print(f"Fix Urls: {fix_urls}")
 
     if not source_urls and not fix_urls:
         print("Error: JSON must contain either 'source_code_url' or 'fix_commit_url'.")
-        return []
+        return [], ''
 
     relevant_files_set = set()
+    strategy = ''
 
-    # --- Process source URLs ---
-    if source_urls:
-        newest_sources = get_newest_github_url(source_urls)
-        for src in newest_sources:
-            if src in processed_urls:
-                print(f"Using cached results for source URL: {src}")
-                relevant_files_set.update(processed_urls[src])
-            elif 'github.com' in src and '/blob/' in src:
-                print(f"Using GitHub blob as relevant file: {src}")
-                processed_urls[src] = [src]
-                relevant_files_set.add(src)
-            else:
-                print(f"Processing source URL: {src}")
-                new_files = process_source_url(src)
-                processed_urls[src] = list(new_files)
-                relevant_files_set.update(new_files)
+    # Process source URLs first
+    relevant_files_set, strategy = handle_source_urls(
+        source_urls, processed_urls, relevant_files_set, strategy
+    )
 
-    # --- Process fix URLs ---
-    if fix_urls:
-        newest_fixes = get_newest_github_url(fix_urls)
-        for fix in newest_fixes:
-            if fix in processed_urls:
-                print(f"Using cached results for fix URL: {fix}")
-                relevant_files_set.update(processed_urls[fix])
-            else:
-                print(f"Processing fix URL: {fix}")
-                changed_files = process_fix_url(fix, True)
-                processed_urls[fix] = list(changed_files)
-                relevant_files_set.update(changed_files)
+    # Process fix URLs if needed
+    relevant_files_set, strategy = handle_fix_urls(
+        fix_urls, processed_urls, relevant_files_set, strategy
+    )
 
-    # Filter out test (.t.) files
+    # Filter and return results
     relevant_files = filter_test_files(relevant_files_set)
+    print_relevant_files(relevant_files)
 
-    # Print results
+    return relevant_files, strategy
+
+
+def handle_source_urls(
+    source_urls: List[str],
+    processed_urls: Dict[str, List[str]],
+    relevant_files_set: set,
+    strategy: str
+) -> Tuple[set, str]:
+    """
+    Process source URLs and update relevant files set.
+    """
+    if not source_urls:
+        return relevant_files_set, strategy
+
+    for src in source_urls:
+        files = fetch_files_from_url(src, processed_urls, is_source=True)
+        if files:
+            relevant_files_set.update(files)
+            strategy = "source"
+
+    return relevant_files_set, strategy
+
+
+def handle_fix_urls(
+    fix_urls: List[str],
+    processed_urls: Dict[str, List[str]],
+    relevant_files_set: set,
+    strategy: str
+) -> Tuple[set, str]:
+    """
+    Process fix URLs only if source URLs didn't produce results.
+    """
+    if not fix_urls or relevant_files_set:
+        return relevant_files_set, strategy
+
+    for fix in fix_urls:
+        files = fetch_files_from_url(fix, processed_urls, is_source=False)
+        processed_urls[fix] = list(files)
+        relevant_files_set.update(files)
+        strategy = "fix"
+
+    return relevant_files_set, strategy
+
+
+def fetch_files_from_url(
+    url: str,
+    processed_urls: Dict[str, List[str]],
+    is_source: bool
+) -> List[str]:
+    """
+    Get files from a URL, using cache if available.
+    """
+    if url in processed_urls:
+        print(f"Using cached results for {'source' if is_source else 'fix'} URL: {url}")
+        return processed_urls[url]
+
+    print(f"Processing {'source' if is_source else 'fix'} URL: {url}")
+    
+    if is_source:
+        new_files = process_source_url(url)  # Calls existing function
+        if new_files:
+            processed_urls[url] = list(new_files)
+            return new_files
+        return []
+    else:
+        changed_files = process_fix_url(url, True)  # Calls existing function
+        return changed_files
+
+
+def print_relevant_files(relevant_files: List[str]) -> None:
+    """
+    Print the list of relevant files.
+    """
     for file_url in relevant_files:
         print(f"  - {file_url}")
-
-    return relevant_files
-
 
 
 def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[str, Any]]]:
@@ -686,7 +867,7 @@ def get_relevant_files(json_file: str) -> Tuple[Dict[str, List[str]], List[Dict[
     
 
 def main():
-    json_file = "/Users/matt/vulnaut/retrieve_github_files_with_AI/test_dataset/0xGuard/filtered_Anyrand.json"
+    json_file = "test_dataset/nethermind/filtered_NM0074-FINAL_PWN_findings.json"
     get_relevant_files(json_file)
 
 

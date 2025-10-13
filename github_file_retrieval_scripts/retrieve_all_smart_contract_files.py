@@ -33,6 +33,8 @@ from pathlib import Path
 from urllib.parse import urlparse, unquote
 from typing import List, Dict, Tuple, Optional, Set
 from config import SMART_CONTRACT_EXTENSIONS
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class GitHubGraphQLRetriever:
@@ -48,6 +50,15 @@ class GitHubGraphQLRetriever:
             'Content-Type': 'application/json',
             'User-Agent': 'SmartContract-GraphQL-Retriever/1.0'
         })
+        retries = Retry(
+        total=5,
+        backoff_factor=1,  # seconds: 1, 2, 4, 8...
+        status_forcelist=[502, 503, 504],
+        allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.graphql_url = "https://api.github.com/graphql"
         self.max_graphql_depth = 8  # Configurable max depth for GraphQL queries
     
@@ -61,33 +72,31 @@ class GitHubGraphQLRetriever:
         if depth <= 0:
             return ""
         
-        blob_fragment = """
-                        ... on Blob {
-                          byteSize
-                          text
-                          isBinary
-                        }"""
-        
+        # Only include path and type, skip content
         if depth == 1:
-            return blob_fragment
+            return """
+            ... on Tree {
+                entries {
+                    name
+                    type
+                    path
+                }
+            }"""
         
-        # Build the tree fragment recursively
         nested_fragment = self.build_tree_fragment(depth - 1)
         
-        tree_fragment = f"""
-                        ... on Tree {{
-                          entries {{
-                            name
-                            type
-                            path
-                            object {{
-                              {blob_fragment}
-                              {nested_fragment}
-                            }}
-                          }}
-                        }}"""
-        
-        return tree_fragment
+        return f"""
+        ... on Tree {{
+            entries {{
+                name
+                type
+                path
+                object {{
+                    {nested_fragment}
+                }}
+            }}
+        }}"""
+
     
     def build_tree_query(self, owner: str, repo: str, branch: str, path: str = "", max_depth: int = None) -> str:
         """Build GraphQL query to fetch entire repository tree with configurable depth."""
@@ -126,7 +135,7 @@ class GitHubGraphQLRetriever:
     
     def execute_graphql_query(self, query: str, variables: Dict) -> Optional[Dict]:
         """Execute GraphQL query with error handling and rate limiting."""
-        max_retries = 3
+        max_retries = 1
         
         for attempt in range(max_retries):
             try:
@@ -149,7 +158,7 @@ class GitHubGraphQLRetriever:
                 elif response.status_code == 403:
                     print(f"Rate limit or permission error (attempt {attempt + 1})")
                     if attempt < max_retries - 1:
-                        time.sleep(60)
+                        time.sleep(5)
                         continue
                     
                 else:
@@ -159,49 +168,29 @@ class GitHubGraphQLRetriever:
             except requests.exceptions.RequestException as e:
                 print(f"Request error (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(30)
+                    time.sleep(5)
                     continue
                     
         return None
     
     def extract_files_from_tree(self, tree_entries: List[Dict], base_path: str = "") -> List[Dict]:
-        """Recursively extract smart contract files from tree structure."""
+        """Extract smart contract file paths without fetching content."""
         smart_contract_files = []
         
         for entry in tree_entries:
-            # Use GraphQL's path if available, otherwise construct it
             entry_path = entry.get('path', f"{base_path}/{entry['name']}" if base_path else entry['name'])
             
             if entry['type'] == 'blob':
-                # Check if it's a smart contract file
-                is_contract = self.is_smart_contract_file(entry['name'])
-                
-                if is_contract and entry.get('object'):
-                    blob = entry['object']
-                    
-                    # Skip binary files and very large files
-                    if blob.get('isBinary', False) or blob.get('byteSize', 0) > 10 * 1024 * 1024:
-                        continue
-                    
-                    # Get content if available
-                    content = blob.get('text', '')
-                    if content and len(content.strip()) > 10:
-                        smart_contract_files.append({
-                            'name': entry['name'],
-                            'path': entry_path,
-                            'content': content,
-                            'size': blob.get('byteSize', len(content)),
-                            'lines': len(content.splitlines()),
-                            'is_valid': True
-                        })
+                if self.is_smart_contract_file(entry['name']):
+                    smart_contract_files.append({
+                        'name': entry['name'],
+                        'path': entry_path
+                    })
             
             elif entry['type'] == 'tree' and entry.get('object', {}).get('entries'):
-                # Recursively process subdirectories
-                subdirectory_files = self.extract_files_from_tree(
-                    entry['object']['entries'], 
-                    entry_path
+                smart_contract_files.extend(
+                    self.extract_files_from_tree(entry['object']['entries'], entry_path)
                 )
-                smart_contract_files.extend(subdirectory_files)
         
         return smart_contract_files
     
@@ -248,6 +237,7 @@ class GitHubGraphQLRetriever:
         Get smart contracts using adaptive depth GraphQL - analyzes repository first.
         This method determines the required depth and uses appropriate GraphQL query.
         """
+
         if verbose:
             print(f"Using adaptive-depth GraphQL...")
         
@@ -278,7 +268,7 @@ class GitHubGraphQLRetriever:
                         smart_contract_paths.append(file_path)
                 
                 if smart_contract_paths:
-                    optimal_depth = self.determine_max_depth(smart_contract_paths)
+                    optimal_depth = min(self.determine_max_depth(smart_contract_paths), 5)
                     if verbose:
                         print(f"   Found {len(smart_contract_paths)} smart contracts, max depth needed: {optimal_depth}")
                 else:
@@ -389,9 +379,14 @@ class GitHubRestRetriever:
             return True
         return False
 
-    def get_commit_sha(self, owner: str, repo: str, branch: str) -> Optional[str]:
-        """Resolve branch to commit SHA using REST API."""
-        url = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}"
+    def get_commit_sha(self, owner: str, repo: str, branch_or_sha: str) -> Optional[str]:
+        """Resolve branch name to commit SHA, or return SHA directly."""
+        # Detect if input is a SHA (40 hex characters)
+        if len(branch_or_sha) == 40 and all(c in "0123456789abcdef" for c in branch_or_sha.lower()):
+            return branch_or_sha
+
+        # Otherwise, resolve branch name via REST API
+        url = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch_or_sha}"
         resp = self.session.get(url, timeout=10)
         if resp.status_code == 200:
             return resp.json()["commit"]["sha"]
@@ -442,19 +437,11 @@ class GitHubRestRetriever:
             filename = item["path"].split("/")[-1]
             is_contract = self.is_smart_contract_file(filename)
             if not is_contract:
-                continue
-
-            # Fetch file content
-            content = self.get_file_content(owner, repo, item["path"], sha)
-            if not content or len(content.strip()) < 10:
-                continue
+                continue            
 
             smart_contract_files.append({
                 "name": filename,
                 "path": item["path"],
-                "content": content,
-                "size": len(content),
-                "lines": len(content.splitlines()),
                 "is_valid": True
             })
 
@@ -609,15 +596,6 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
         
         # Generate summary statistics
         extensions = {}
-        total_content_size = 0
-        total_lines = 0
-        
-        for file_info in smart_contract_files:
-            ext = Path(file_info['name']).suffix.lower()
-            extensions[ext] = extensions.get(ext, 0) + 1
-            
-            total_content_size += len(file_info['content'])
-            total_lines += file_info.get('lines', 0)
         
         # Generate blob URLs
         display_ref = commit_sha if commit_sha else branch
@@ -630,8 +608,6 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
             'subpath': subpath,
             'total_files': len(smart_contract_files),
             'extensions': extensions,
-            'total_content_size': total_content_size,
-            'total_lines': total_lines,
             'method_used': method_used
         }
         
@@ -643,8 +619,6 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
             print(f"Reference: {summary['branch']}")
             print(f"Method: {method_used} {'⚡' if method_used == 'graphql' else '🐌'}")
             print(f"Files retrieved: {summary['total_files']}")
-            print(f"Total content: {summary['total_content_size']:,} characters")
-            print(f"Total lines: {summary['total_lines']:,}")
         
         return {
             'files': smart_contract_files,
@@ -700,7 +674,7 @@ def save_files_to_directory(results: Dict, output_dir: str) -> bool:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(file_info['content'])
+                f.write(file_info)
         
         return True
     except Exception as e:
@@ -739,7 +713,6 @@ if __name__ == "__main__":
         for i, file in enumerate(results['files'], 1):
             print(f"{i}. {file['path']}")
             print(f"   Size: {file['size']:,} chars, Lines: {file.get('lines', 'N/A')}")
-            print(f"   Preview: {file['content'][:100].replace(chr(10), ' ')}...")
             print()
     else:
         print("\n✅ No smart contract files found in this repository/reference")

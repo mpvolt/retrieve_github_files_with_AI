@@ -281,21 +281,17 @@ def save_updated_reports(json_file, reports):
     from pathlib import Path
     
     json_path = Path(json_file)
-    json_dir = json_path.parent
-    print(f"Using pathlib - parent dir: {json_dir}")
-    print(f"Parent dir exists (pathlib): {json_dir.exists()}")
     
-    if json_dir != Path('.'):  # Only create directory if there's a path
-        print(f"Creating directory: {json_dir}")
-        json_dir.mkdir(parents=True, exist_ok=True)
+    # Create parent directory if it doesn't exist
+    if json_path.parent.name:  # Only if there's actually a parent directory specified
+        json_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Try the write operation
-    print(f"Attempting to write {len(reports)} reports...")
-    with open(json_file, 'w', encoding='utf-8') as f:
+    # Write the updated reports
+    print(f"Attempting to write {len(reports)} reports to {json_file}...")
+    with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(reports, f, indent=2)
     
-    print(f"✓ Successfully wrote file")
-    print(f"✓ Updated JSON with afflicted_github_code_blob fields saved to: {json_file}")
+    print(f"✓ Successfully updated {json_file} with afflicted_github_code_blob fields")
 
 
 def print_summary_header():
@@ -461,12 +457,12 @@ def extract_report_fields(report, i):
     return fields
 
 
-def should_use_ai(report, relevant_files):
+def should_use_ai(strategy):
     MAX_FILES_TO_CHECK = 20
     """Decide whether to use AI first, based on URLs and number of files."""
-    if report.get("source_code_url"):# and len(relevant_files) < MAX_FILES_TO_CHECK:
+    if strategy == "source":# and len(relevant_files) < MAX_FILES_TO_CHECK:
         return "source_code"
-    elif report.get("fix_commit_url"):# and len(relevant_files) < MAX_FILES_TO_CHECK:
+    elif strategy == "fix":# and len(relevant_files) < MAX_FILES_TO_CHECK:
         return "fix_commit"   
     return None
 
@@ -514,55 +510,85 @@ def initialize_report_fields(report):
     report.setdefault("relevant_functions", {})
     report.setdefault("languages", [])
 
-def handle_source_blob_urls(report):
+
+def handle_source_blob_urls(report, fields):
     """Check source_code_url for direct GitHub blob references."""
+    
     source_code_url = report.get("source_code_url")
     if not source_code_url:
         return 
 
     urls_to_check = source_code_url if isinstance(source_code_url, list) else [source_code_url]
-    afflicted_github_code_blobs = []
+    relevant_files = []
     for url in urls_to_check:
+        
         if isinstance(url, str) and "github.com" in url and "/blob/" in url:
             filename = url.strip().split("/")[-1]
-            if filename and any(filename.endswith(SMART_CONTRACT_EXTENSIONS)):
-                afflicted_github_code_blob.append(url)
-    
-    report["afflicted_github_code_blob"] = afflicted_github_code_blobs
-    if report.get("afflicted_github_code_blob") and not report.get("context"):
-        print("Case 2: source code url is already a blob")
-        determine_relevant_functions(report)
+            cleaned_url = re.sub(r'[^\w\-\./:?=&%#]', '', url)
+            if filename and any(ext in filename for ext in SMART_CONTRACT_EXTENSIONS):
+                relevant_files.append(cleaned_url)
 
+    if relevant_files:
+        print("Case 2: Source Code Already a Blob")
+        matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
+        matches = matcher.process_files(fields, relevant_files)
 
-def handle_fix_commit_blobs(report):
+        if matches:
+            report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
+            
+            #Get fixed_github_code_blob from fix_commit_url if we can
+            if report.get("fix_commit_url"):
+                fixed_code_blobs = []
+                seen_fixed_blobs = set()
+                for match in matches or []:
+                    try:
+                        fix_commit_url = report.get("fix_commit_url", "")
+                
+                        # Handle both string and list cases
+                        fix_commit_urls = [fix_commit_url] if isinstance(fix_commit_url, str) else fix_commit_url
+                        
+                        for url in fix_commit_urls:
+                            fixed_blob = matcher.construct_blob_from_ref(url, match.blob_url)
+                            
+                            # Only add if not already seen
+                            if fixed_blob not in seen_fixed_blobs:
+                                fixed_code_blobs.append(fixed_blob)
+                                seen_fixed_blobs.add(fixed_blob)
+                            
+                            break  # Stop after finding first valid match
+                    except Exception as e:
+                        print(f"[Warning] Error handling match {match}: {e}")
+                report["fixed_github_code_blob"] = list(set(fixed_code_blobs))  # Remove any remaining duplicates
+        
+
+def handle_fix_commit_blobs(report, fields):
     """Extract fixed blobs from fix_commit_url if present."""
     fix_commit_url = report.get("fix_commit_url")
     if not fix_commit_url:
         return
 
     urls_to_check = fix_commit_url if isinstance(fix_commit_url, list) else [fix_commit_url]
+    relevant_files = []
     for url in urls_to_check:
         if isinstance(url, str) and "github.com" in url and "/blob/" in url:
             filename = url.strip().split("/")[-1]
-            if filename and any(filename.endswith(SMART_CONTRACT_EXTENSIONS)):
-                report["fixed_github_code_blob"].append(url)
+            if filename and filename.endswith(tuple(SMART_CONTRACT_EXTENSIONS)):
+                relevant_files.append(url)
 
-    if report.get("fixed_github_code_blob"):
-        print("Case 3: fix commit url is already a blob")
+    if relevant_files:
+        handle_ai_strategy(report, fields, relevant_files, "fix")
 
 
 
-def handle_ai_strategy(report, fields, relevant_files):
+def handle_ai_strategy(report, fields, relevant_files, strategy):
     """Run AI-based processing depending on strategy, with robust error handling."""
 
-    print("Using AI strategy")
-
     try:
-        ai_strategy = should_use_ai(report, relevant_files)
+        ai_strategy = should_use_ai(strategy)
     except Exception as e:
         print(f"[Error] Failed to determine AI strategy: {e}")
         report["ai_strategy_error"] = str(e)
-        return report  # stop early since we can’t proceed
+        return report
 
     try:
         matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
@@ -572,45 +598,25 @@ def handle_ai_strategy(report, fields, relevant_files):
         return report
 
     try:
+        matches = []
+        
         if ai_strategy == "fix_commit":
             print("Using fix commit strategy")
-            matches = matcher.process_files(fields, relevant_files)
-
+            matches = process_fix_commit_strategy(report, fields, relevant_files, matcher)
+            
+            # If no matches, try source code strategy
             if not matches:
-                print("[Info] No matches found initially, trying fix_commit_url...")
-                try:
-                    relevant_files = process_fix_url(report.get("fix_commit_url"), False)
-                    matches = matcher.process_files(fields, relevant_files)
-                except Exception as e:
-                    print(f"[Error] Failed processing fix_commit_url: {e}")
-                    report["fix_commit_error"] = str(e)
-
-            fixed_code_blobs = []
-            for match in matches or []:
-                try:
-                    fix_commit_url = report.get("fix_commit_url", "")
-                    if any(k in fix_commit_url for k in ["tree", "compare", "commit"]):
-                        original_blob_url = find_file_before_change(fix_commit_url, match.blob_url)
-                        if original_blob_url and original_blob_url != "NEW FILE":
-                            match.blob_url = original_blob_url
-                            fixed_blob = matcher.construct_blob_from_ref(
-                                report.get("fix_commit_url"), original_blob_url
-                            )
-                            fixed_code_blobs.append(fixed_blob)
-                except Exception as e:
-                    print(f"[Warning] Error handling match {match}: {e}")
-
-            report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
-            report["fixed_github_code_blob"] = fixed_code_blobs or []
+                print("[Info] No matches with fix_commit strategy, trying source_code strategy...")
+                matches = attempt_source_code_strategy(report, fields, matcher)
 
         elif ai_strategy == "source_code":
             print("Using source code strategy")
-            try:
-                matches = matcher.process_files(fields, relevant_files)
-                report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
-            except Exception as e:
-                print(f"[Error] Failed processing source_code strategy: {e}")
-                report["source_code_error"] = str(e)
+            matches = attempt_source_code_strategy(report, fields, matcher)
+            
+            # If no matches, try fix commit strategy
+            if not matches:
+                print("[Info] No matches with source_code strategy, trying fix_commit strategy...")
+                matches = process_fix_commit_strategy(report, fields, relevant_files, matcher)
 
         else:
             print(f"[Info] No recognized AI strategy: {ai_strategy}")
@@ -621,6 +627,107 @@ def handle_ai_strategy(report, fields, relevant_files):
         report["general_ai_error"] = str(e)
 
     return report
+
+
+def process_fix_commit_strategy(report, fields, relevant_files, matcher):
+    """Process files using the fix commit strategy."""
+    matches = matcher.process_files(fields, relevant_files)
+
+    if not matches:
+        print("[Info] No matches found initially, looking at other files in the repo...")
+        matches = []
+        seen_urls = set()
+        
+        try:
+            fix_commit_url = report.get("fix_commit_url")
+            if isinstance(fix_commit_url, str):
+                fix_commit_urls = [fix_commit_url]
+            else:
+                fix_commit_urls = fix_commit_url or []
+            
+            for url in fix_commit_urls:
+                relevant_files = process_fix_url(url, False)
+                for fm in matcher.process_files(fields, relevant_files):
+                    if fm.blob_url not in seen_urls:
+                        matches.append(fm)
+                        seen_urls.add(fm.blob_url)
+        except Exception as e:
+            print(f"[Error] Failed processing fix_commit_url: {e}")
+            report["fix_commit_error"] = str(e)
+
+    fixed_code_blobs = []
+    seen_match_urls = set()
+    seen_fixed_blobs = set()
+
+    for match in matches or []:
+        try:
+            fix_commit_url = report.get("fix_commit_url", "")
+            
+            # Handle both string and list cases
+            fix_commit_urls = [fix_commit_url] if isinstance(fix_commit_url, str) else fix_commit_url
+            
+            for url in fix_commit_urls:
+                if any(k in url for k in ["tree", "compare", "commit", "pull"]):
+                    original_blob_url = find_file_before_change(url, match.blob_url)
+                    if original_blob_url and original_blob_url != "NEW FILE":
+                        match.blob_url = original_blob_url
+                        fixed_blob = matcher.construct_blob_from_ref(url, original_blob_url)
+                        
+                        # Only add if not already seen
+                        if fixed_blob not in seen_fixed_blobs:
+                            fixed_code_blobs.append(fixed_blob)
+                            seen_fixed_blobs.add(fixed_blob)
+                        
+                        break  # Stop after finding first valid match
+        except Exception as e:
+            print(f"[Warning] Error handling match {match}: {e}")
+
+    if not report.get("afflicted_github_code_blob"):
+        # Remove duplicates from matches using blob_url as key
+        unique_matches = []
+        for m in matches or []:
+            if m.blob_url not in seen_match_urls:
+                unique_matches.append(m)
+                seen_match_urls.add(m.blob_url)
+        
+        report["afflicted_github_code_blob"] = [m.blob_url for m in unique_matches]
+        report["fixed_github_code_blob"] = list(set(fixed_code_blobs))  # Remove any remaining duplicates
+        
+    return matches
+
+
+def attempt_source_code_strategy(report, fields, matcher):
+    """Process files using the source code strategy."""
+    try:
+        source_code_url = report.get("source_code_url")
+        if not source_code_url:
+            print("[Info] No source_code_url available for fallback")
+            return []
+        
+        # Get relevant files from source URL
+        if isinstance(source_code_url, str):
+            source_urls = [source_code_url]
+        else:
+            source_urls = source_code_url or []
+        
+        relevant_files = []
+        for url in source_urls:
+            files = process_source_url(url)
+            if files:
+                relevant_files.extend(files)
+        
+        if not relevant_files:
+            print("[Info] No relevant files found from source_code_url")
+            return []
+        
+        matches = matcher.process_files(fields, relevant_files)
+        report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
+        return matches
+        
+    except Exception as e:
+        print(f"[Error] Failed processing source_code strategy: {e}")
+        report["source_code_error"] = str(e)
+        return []
 
 
 def determine_relevant_functions(report):
@@ -739,17 +846,16 @@ def determine_relevant_functions(report):
 def assign_functions_and_languages(report):
     """Determine relevant functions and detect languages from afflicted blobs."""
 
-    languages = []
+    languages = set()
     determine_relevant_functions(report)
-    for github_blob in report["afflicted_github_code_blob"]: 
+    for github_blob in report.get("afflicted_github_code_blob"): 
         print(github_blob)       
         # Detect language from extension
         ext = '.' + github_blob.split('.')[-1].lower()
         lang = SMART_CONTRACT_LANGUAGES.get(ext)
-        languages.append(lang)
+        languages.add(lang)
 
-    if not report.get("language"):
-        report["language"] = languages
+    report["language"] = list(languages)
 
 def process_single_report(report, i, processed_urls, json_file):
     """
@@ -763,23 +869,25 @@ def process_single_report(report, i, processed_urls, json_file):
     print(f"\nProcessing report: {fields['title']}")
 
     # Case 1: already has afflicted blobs → just get functions/languages, no further processing
-    if report.get("afflicted_github_code_blob"):
-        print("Case 1: already has afflicted blobs")
+    if report.get("afflicted_github_code_blob") and not report.get("context"):
+        print("Case 1: already has afflicted blobs, but no function context")
         assign_functions_and_languages(report)
         return report
 
     # Case 2: source code url is already a blob -> needs special processing
-    handle_source_blob_urls(report)
+    handle_source_blob_urls(report, fields)
 
     # Case 3: fix commit url is already a blob -> needs special processing
-    handle_fix_commit_blobs(report)
+    handle_fix_commit_blobs(report, fields)
 
     # Case 4 (Normal Case): Process source/fix url using AI-based matching strategy
-    relevant_files = determine_relevant_files(report, i, processed_urls, json_file)
-    handle_ai_strategy(report, fields, relevant_files)
+    if not report.get("afflicted_github_code_blob"):
+        relevant_files, strategy = determine_relevant_files(report, i, processed_urls, json_file)
+        handle_ai_strategy(report, fields, relevant_files, strategy)
 
-    # Case 5: extract relevant function names + coding language used
-    assign_functions_and_languages(report)
+    # Case 5: If we have a github blob, extract relevant function names + coding language used
+    if not report.get("context") and report.get("afflicted_github_code_blob"):
+        assign_functions_and_languages(report)
 
     return report
 
@@ -834,7 +942,7 @@ def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     
     # Use the CORRECT filename (note "copy.json" instead of ".json")
-    json_file = "test_dataset/0xGuard/filtered_Anyrand.json"
+    json_file = "test_dataset/nethermind/filtered_NM0074-FINAL_PWN_findings.json"
     
     analyze_relevant_files(json_file)
     #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"

@@ -26,7 +26,7 @@ class FileMatch:
     content_preview: str = ""
 
 
-MIN_THRESHOLD = 75
+MIN_THRESHOLD = 70
 
 class VulnerabilityFileMatcher:
     """Main class for matching vulnerability reports to source files."""
@@ -131,50 +131,113 @@ class VulnerabilityFileMatcher:
         except Exception:
             return blob_url.split('/')[-1]
     
-    def score_file_match(self, vulnerability_report: Dict[str, Any], file_content: str, file_path: str) -> Dict[str, Any]:
-        """Use GPT-4 to score how well a file matches the vulnerability report."""
+    def chunk_file_content(self, content: str, max_chunk_size: int = 8000, overlap: int = 500) -> List[str]:
+        """Split file content into overlapping chunks."""
+        if len(content) <= max_chunk_size:
+            return [content]
         
-        # Truncate file content if too long (GPT-4 token limits)
-        max_content_length = 8000
-        if len(file_content) > max_content_length:
-            file_content = file_content[:max_content_length] + "\n... [TRUNCATED]"
+        chunks = []
+        start = 0
+        
+        while start < len(content):
+            end = start + max_chunk_size
+            chunk = content[start:end]
+            chunks.append(chunk)
+            
+            # Move start forward, accounting for overlap
+            start = end - overlap
+            
+            # Break if we've covered the whole file
+            if end >= len(content):
+                break
+        
+        return chunks
+
+
+    def score_file_match(self, vulnerability_report: Dict[str, Any], file_content: str, file_path: str) -> Dict[str, Any]:
+        """Use GPT-4 to score how well a file matches the vulnerability report.
+        Handles large files by chunking and aggregating scores."""
+        
+        max_chunk_size = 8000
+        chunks = self.chunk_file_content(file_content, max_chunk_size)
+        
+        # If single chunk, process normally
+        if len(chunks) == 1:
+            return self._score_single_chunk(vulnerability_report, chunks[0], file_path, chunk_info="")
+        
+        # Process multiple chunks
+        print(f"  File too large, processing {len(chunks)} chunks...")
+        chunk_results = []
+        
+        for idx, chunk in enumerate(chunks, 1):
+            chunk_info = f" (chunk {idx}/{len(chunks)})"
+            result = self._score_single_chunk(vulnerability_report, chunk, file_path, chunk_info)
+            chunk_results.append(result)
+        
+        # Aggregate results: use max score and combine key matches
+        max_score_result = max(chunk_results, key=lambda x: x.get('score', 0))
+        all_key_matches = []
+        for result in chunk_results:
+            all_key_matches.extend(result.get('key_matches', []))
+        
+        # Remove duplicates while preserving order
+        unique_matches = []
+        seen = set()
+        for match in all_key_matches:
+            if match not in seen:
+                unique_matches.append(match)
+                seen.add(match)
+        
+        return {
+            "score": max_score_result.get('score', 0),
+            "reasoning": f"Max score from {len(chunks)} chunks: {max_score_result.get('reasoning', 'N/A')}",
+            "confidence": max_score_result.get('confidence', 'low'),
+            "key_matches": unique_matches
+        }
+
+
+    def _score_single_chunk(self, vulnerability_report: Dict[str, Any], content: str, file_path: str, chunk_info: str = "") -> Dict[str, Any]:
+        """Score a single chunk of file content."""
         
         prompt = f"""
-You are a security expert analyzing whether a source code file matches a vulnerability report.
+    You are a security expert analyzing whether a source code file matches a vulnerability report.
 
-VULNERABILITY REPORT:
-Title: {vulnerability_report.get('title', 'N/A')}
-Description: {vulnerability_report.get('description', 'N/A')}
-Recommendation: {vulnerability_report.get('recommendation', 'N/A')}
-Broken Code Snippets: {vulnerability_report.get('broken_code_snippets', [])}
-Files: {vulnerability_report.get('files', 'N/A')}
-FILE TO ANALYZE:
-File Path: {file_path}
-File Content:
-{file_content}
+    VULNERABILITY REPORT:
+    Title: {vulnerability_report.get('title', 'N/A')}
+    Description: {vulnerability_report.get('description', 'N/A')}
+    Recommendation: {vulnerability_report.get('recommendation', 'N/A')}
+    Broken Code Snippets: {vulnerability_report.get('broken_code_snippets', [])}
+    Source Code URL: {vulnerability_report.get('source_code_url', 'N/A')}
+    Fix Commit URL: {vulnerability_report.get('fix_commit_url', 'N/A')}
+    Files: {vulnerability_report.get('files', 'N/A')}
 
-TASK:
-Score this file from 0-100 based on how likely it contains the vulnerability described:
-- 0: Completely irrelevant
-- 1-30: Low relevance (mentions some related concepts but unlikely to be the vulnerable file)
-- 31-60: Medium relevance (contains related functionality but may not be the exact vulnerable code)
-- 61-89: High relevance (strong indicators this contains the vulnerability)
-- 90-100: Very high relevance (almost certainly contains the exact vulnerability)
+    FILE TO ANALYZE:
+    File Path: {file_path}{chunk_info}
+    File Content:
+    {content}
 
-Consider:
-1. Function names mentioned in the vulnerability
-2. Code patterns described in the vulnerability
-3. Variable names and logic described
-4. Overall context and purpose of the file
+    TASK:
+    Score this file from 0-100 based on how likely it contains the vulnerability described:
+    - 0: Completely irrelevant
+    - 1-30: Low relevance (mentions some related concepts but unlikely to be the vulnerable file)
+    - 31-60: Medium relevance (contains related functionality but may not be the exact vulnerable code)
+    - 61-89: High relevance (strong indicators this contains the vulnerability)
+    - 90-100: Very high relevance (almost certainly contains the exact vulnerability)
 
-Respond in JSON format:
-{{
-    "score": <number 0-100>,
-    "reasoning": "<brief explanation of your scoring>",
-    "confidence": "<high|medium|low>",
-    "key_matches": ["<list of specific matches found>"]
-}}
-"""
+    Consider:
+    1. Function names mentioned in the vulnerability
+    2. Code patterns described in the vulnerability
+    3. Variable names and logic described
+    4. Overall context and purpose of the file
+
+    Respond in JSON format:
+    {{
+        "score": <number 0-100>,
+        "reasoning": "<brief explanation of your scoring>",
+        "confidence": "<high|medium|low>",
+        "key_matches": ["<list of specific matches found>"]
+    }}
+    """
 
         try:
             response = self.openai_client.chat.completions.create(
@@ -201,14 +264,14 @@ Respond in JSON format:
                 }
         
         except Exception as e:
-            print(f"Error scoring file {file_path}: {e}")
+            print(f"Error scoring file {file_path}{chunk_info}: {e}")
             return {
                 "score": 0,
                 "reasoning": f"API error: {e}",
                 "confidence": "low",
                 "key_matches": []
             }
-    
+
 
     def process_files(self, vulnerability_report: Dict[str, Any], blob_urls: List[str]) -> List[FileMatch]:
         """Process all files and return sorted matches."""
@@ -228,7 +291,7 @@ Respond in JSON format:
                 print(f"  Skipped (could not fetch content)")
                 continue
             
-            # Score the match
+            # Score the match (now handles chunking internally)
             score_result = self.score_file_match(vulnerability_report, content, file_path)
             
             # Create match object
@@ -242,6 +305,10 @@ Respond in JSON format:
             
             matches.append(match)
             print(f"  Score: {match.total_score}/100 - {score_result.get('reasoning', 'No reasoning')}")
+
+            if match.total_score >= 85:
+                print(f"  Found high-confidence match (score >= 85). Returning immediately.")
+                return [match]
         
         # Sort by score (highest first)
         matches.sort(key=lambda x: x.total_score, reverse=True)
