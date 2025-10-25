@@ -8,6 +8,7 @@ from fuzzywuzzy import fuzz
 from github_analysis_scripts.determine_relevant_files import determine_relevant_files, process_fix_url, process_source_url, find_file_before_change
 from github_analysis_scripts.match_files_to_report_with_heuristics import match_bug_to_files
 from github_analysis_scripts.match_files_to_report_with_AI import VulnerabilityFileMatcher
+from github_analysis_scripts.add_vulnerability_type import get_vulnerability_type
 import requests
 import time
 from urllib.parse import urlparse, unquote
@@ -889,6 +890,14 @@ def process_single_report(report, i, processed_urls, json_file):
     if not report.get("context") and report.get("afflicted_github_code_blob"):
         assign_functions_and_languages(report)
 
+    # Case 6: No source/fix links, only afflicted_source_code
+    if not report.get("afflicted_github_code_blob") and report.get("afflicted_source_code"):
+        determine_relevant_functions(report)
+
+    if not report.get("type") and report.get("title") or report.get("description"):
+        result = get_vulnerability_type(report)    
+        report['type'] = result.get("type", "unknown")
+
     return report
 
 def analyze_relevant_files(json_file):
@@ -939,14 +948,35 @@ def analyze_relevant_files(json_file):
     return all_matches
 
 def main():
-    script_dir = os.path.dirname(os.path.realpath(__file__))
+    import argparse
+    import sys
     
-    # Use the CORRECT filename (note "copy.json" instead of ".json")
-    json_file = "test_dataset/nethermind/filtered_NM0074-FINAL_PWN_findings.json"
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Analyze relevant files from JSON vulnerability data')
+    parser.add_argument('input_file', nargs='?', 
+                       default="retrieve_github_files_with_AI/test_dataset/0xguard/filtered_Anyrand.json",
+                       help='Path to JSON file to analyze (default: retrieve_github_files_with_AI/test_dataset/0xguard/filtered_Anyrand.json)')
     
-    analyze_relevant_files(json_file)
-    #json_file = "veridise/filtered_VAR_SmoothCryptoLib_240718_V3-findings.json"
-    #json_file = "veridise/filtered_VAR-Untangled-250508-vaults-V2-findings.json"
+    args = parser.parse_args()
+    
+    # Validate file exists
+    if not os.path.exists(args.input_file):
+        print(f"Error: File '{args.input_file}' does not exist.")
+        sys.exit(1)
+    
+    if not os.path.isfile(args.input_file):
+        print(f"Error: '{args.input_file}' is not a file.")
+        sys.exit(1)
+    
+    if not args.input_file.lower().endswith('.json'):
+        print(f"Warning: '{args.input_file}' does not appear to be a JSON file.")
+        response = input("Continue anyway? (y/n): ")
+        if response.lower() != 'y':
+            sys.exit(0)
+    
+    print(f"Analyzing file: {args.input_file}")
+    analyze_relevant_files(args.input_file)
+
         
 
 if __name__ == "__main__":
