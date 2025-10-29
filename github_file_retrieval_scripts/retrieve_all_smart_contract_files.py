@@ -65,7 +65,7 @@ class GitHubGraphQLRetriever:
     def is_smart_contract_file(self, filename: str) -> bool:
         """Check if a file is a smart contract based on its extension."""
         filename_lower = filename.lower()
-        return filename_lower.endswith(SMART_CONTRACT_EXTENSIONS)
+        return filename_lower.endswith(SMART_CONTRACT_EXTENSIONS) and ".t." not in filename
     
     def build_tree_fragment(self, depth: int) -> str:
         """Recursively build GraphQL tree fragment for specified depth."""
@@ -375,7 +375,7 @@ class GitHubRestRetriever:
     def is_smart_contract_file(self, filename: str) -> Tuple[bool, str]:
         """Check if file is a smart contract based on extension."""
         filename_lower = filename.lower()
-        if filename_lower.endswith(SMART_CONTRACT_EXTENSIONS):
+        if filename_lower.endswith(SMART_CONTRACT_EXTENSIONS) and ".t." not in filename:
             return True
         return False
 
@@ -620,8 +620,9 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
             print(f"Method: {method_used} {'⚡' if method_used == 'graphql' else '🐌'}")
             print(f"Files retrieved: {summary['total_files']}")
         
+        #Only return the first 1000 if there's more than 1000
         return {
-            'files': smart_contract_files,
+            'files': smart_contract_files[:1000] if len(smart_contract_files) > 1000 else smart_contract_files,
             'summary': summary
         }
         

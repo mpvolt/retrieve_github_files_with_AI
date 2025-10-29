@@ -333,7 +333,7 @@ class GitCloneHandler:
                 status_map = {'A': 'added', 'D': 'removed', 'M': 'modified', 'R': 'renamed', 'C': 'copied'}
                 status = status_map.get(status_char, 'modified')
 
-                if not filename.endswith(SMART_CONTRACT_EXTENSIONS):
+                if not filename.endswith(SMART_CONTRACT_EXTENSIONS) or ".t." in filename:
                     continue
 
                 old_blob = None
@@ -584,7 +584,7 @@ class GitHubAPIHandler:
 
             for file_info in files_data:
                 filename = file_info['filename']
-                if not filename.endswith(SMART_CONTRACT_EXTENSIONS):
+                if not filename.endswith(SMART_CONTRACT_EXTENSIONS) or ".t." in filename:
                     continue
 
                 previous_filename = file_info.get('previous_filename', filename)

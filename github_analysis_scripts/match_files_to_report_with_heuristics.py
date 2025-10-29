@@ -583,7 +583,7 @@ def filter_relevant_files(file_urls: Set[str], bug_report: Dict) -> Set[str]:
     for file_url in non_test_files:
         file_path = get_file_path_from_blob_url(file_url)
         file_extension = Path(file_path).suffix.lower()
-        if file_extension in SMART_CONTRACT_EXTENSIONS:
+        if file_extension in SMART_CONTRACT_EXTENSIONS and ".t." not in file_url:
             filtered_files.add(file_url)
     
     return filtered_files
@@ -746,7 +746,7 @@ def calculate_filename_mention_score(bug_report: Dict, file_path: str) -> tuple[
     
     # Check for common contract naming patterns in smart contract files
     file_extension = Path(file_path).suffix.lower()
-    if file_extension in SMART_CONTRACT_EXTENSIONS:
+    if file_extension in SMART_CONTRACT_EXTENSIONS and ".t." not in file_path:
         # Look for contract/module names that might match the filename
         contract_patterns = []
         

@@ -526,7 +526,7 @@ def handle_source_blob_urls(report, fields):
         if isinstance(url, str) and "github.com" in url and "/blob/" in url:
             filename = url.strip().split("/")[-1]
             cleaned_url = re.sub(r'[^\w\-\./:?=&%#]', '', url)
-            if filename and any(ext in filename for ext in SMART_CONTRACT_EXTENSIONS):
+            if filename and any(ext in filename for ext in SMART_CONTRACT_EXTENSIONS) and ".t." not in filename:
                 relevant_files.append(cleaned_url)
 
     if relevant_files:
@@ -573,7 +573,7 @@ def handle_fix_commit_blobs(report, fields):
     for url in urls_to_check:
         if isinstance(url, str) and "github.com" in url and "/blob/" in url:
             filename = url.strip().split("/")[-1]
-            if filename and filename.endswith(tuple(SMART_CONTRACT_EXTENSIONS)):
+            if filename and filename.endswith(tuple(SMART_CONTRACT_EXTENSIONS)) and ".t." not in filename:
                 relevant_files.append(url)
 
     if relevant_files:
@@ -868,6 +868,10 @@ def process_single_report(report, i, processed_urls, json_file):
 
     # Attach relevant files
     print(f"\nProcessing report: {fields['title']}")
+
+    # Case 0: already processed, don't need to do anything
+    if report.get("afflicted_github_code_blob") and report.get("context"):
+        return report
 
     # Case 1: already has afflicted blobs → just get functions/languages, no further processing
     if report.get("afflicted_github_code_blob") and not report.get("context"):

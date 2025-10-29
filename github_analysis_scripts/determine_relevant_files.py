@@ -9,8 +9,8 @@ from github_file_retrieval_scripts.retrieve_changed_commits_files import handle_
 from github_file_retrieval_scripts.retrieve_changed_pull_request_files import handle_pr_files_via_api
 from github_file_retrieval_scripts.retrieve_changed_compare_files import handle_compare_files_via_api
 from urllib.parse import urlparse
-from config import SMART_CONTRACT_EXTENSIONS
 from collections import Counter
+
 import re
 API_KEY = os.getenv('GITHUB_API_KEY')
 
