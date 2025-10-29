@@ -620,7 +620,7 @@ def get_smart_contracts(github_url: str, api_key: str, verbose: bool = True) -> 
             print(f"Method: {method_used} {'⚡' if method_used == 'graphql' else '🐌'}")
             print(f"Files retrieved: {summary['total_files']}")
         
-        #Only return the first 1000 if there's more than 1000
+        #Only return the first 1000 files if there's more than 1000
         return {
             'files': smart_contract_files[:1000] if len(smart_contract_files) > 1000 else smart_contract_files,
             'summary': summary

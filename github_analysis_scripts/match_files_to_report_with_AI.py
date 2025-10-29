@@ -306,8 +306,8 @@ class VulnerabilityFileMatcher:
             matches.append(match)
             print(f"  Score: {match.total_score}/100 - {score_result.get('reasoning', 'No reasoning')}")
 
-            if match.total_score >= 85:
-                print(f"  Found high-confidence match (score >= 85). Returning immediately.")
+            if match.total_score >= 95:
+                print(f"  Found high-confidence match (score >= 95). Returning immediately.")
                 return [match]
         
         # Sort by score (highest first)
