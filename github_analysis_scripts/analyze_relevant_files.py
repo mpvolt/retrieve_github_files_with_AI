@@ -621,8 +621,6 @@ def handle_ai_strategy(report, fields, relevant_files, strategy):
         elif ai_strategy == "source_code":
             print("Using source code strategy")
             matches = attempt_source_code_strategy(report, fields, matcher, relevant_files)
-            
-            
 
         else:
             print(f"[Info] No recognized AI strategy: {ai_strategy}")
@@ -700,15 +698,48 @@ def attempt_source_code_strategy(report, fields, matcher, relevant_files):
         else:
             context = []
             for m in matches:
-                context.append({
-                    "source":m.blob_url,
-                    "functions":m.functions
-                })
+                # If possible: assign fixed file version for false positive reference
+                if report.get("fix_commit_url"):
+                    fixed_blobs = []
+                    
+                    # Normalize to list if it's a single string
+                    fix_urls = report.get("fix_commit_url")
+                    if isinstance(fix_urls, str):
+                        fix_urls = [fix_urls]
+                    
+                    for fix_url in fix_urls:
+                        # Skip empty or invalid URLs
+                        if not fix_url or not isinstance(fix_url, str) or fix_url.strip() in ["", "/"]:
+                            print(f"Skipping invalid fix_url: {repr(fix_url)}")
+                            continue
+                            
+                        try:
+                            if any(k in fix_url for k in ["tree", "compare", "commit", "pull"]):
+                                fixed_blob = matcher.construct_blob_from_ref(fix_url, m.blob_url)
+                                fixed_blobs.append(fixed_blob)
+                                print(f"Created fixed blob: {fixed_blob}")
+                        except Exception as e:
+                            print(f"Warning: Could not construct blob from {fix_url}: {e}")
+                            continue
+                    
+                    context.append({
+                        "source": m.blob_url,
+                        "fix": fixed_blobs,
+                        "functions": m.functions
+                    })
+                else:
+                    context.append({
+                        "source": m.blob_url,
+                        "functions": m.functions,
+                    })
+                    
             report["context"] = context
         return matches
         
     except Exception as e:
         print(f"[Error] Failed processing source_code strategy: {e}")
+        import traceback
+        traceback.print_exc()
         report["source_code_error"] = str(e)
         return []
 

@@ -288,7 +288,7 @@ class VulnerabilityFileMatcher:
             max_workers: Maximum number of parallel workers (default: 5)
             
         Returns:
-            list: List of FileMatch objects containing source url and relevant functions
+            list: List of FileMatch objects containing source url and relevant functions (only highest scoring)
         """
         matches = []
         
@@ -346,9 +346,34 @@ class VulnerabilityFileMatcher:
             results.sort(key=lambda x: x[0])
             matches = [match for _, match in results]
         
+        # Find the highest score across all files and functions
+        if matches:
+            max_score = 0
+            for match in matches:
+                for func in match.functions:
+                    if func['score'] > max_score:
+                        max_score = func['score']
+            
+            print(f"\nHighest score across all files: {max_score}")
+            
+            # Filter matches to only include functions with the highest score
+            filtered_matches = []
+            for match in matches:
+                high_score_functions = [func for func in match.functions if func['score'] == max_score]
+                if high_score_functions:
+                    filtered_match = FileMatch(
+                        file_path=match.file_path,
+                        blob_url=match.blob_url,
+                        functions=high_score_functions
+                    )
+                    filtered_matches.append(filtered_match)
+            
+            print(f"Files with highest scoring functions: {len(filtered_matches)}")
+            return filtered_matches
+        
         return matches
-    
-    def score_file_match(self, vulnerability_report: Dict[str, Any], file_content: str, file_path: str, max_workers: int = 10) -> List[str]:
+
+    def score_file_match(self, vulnerability_report: Dict[str, Any], file_content: str, file_path: str, max_workers: int = 10) -> List[Dict[str, Any]]:
         """Use GPT-4 to score how well functions match the vulnerability report.
         Handles scoring in parallel for better performance.
         
@@ -359,7 +384,7 @@ class VulnerabilityFileMatcher:
             max_workers: Maximum number of parallel workers for function scoring (default: 10)
             
         Returns:
-            list: List of function names with score >= 90
+            list: List of dicts with function names and scores >= 70
         """
         
         all_functions = self.extract_all_functions(file_content)
@@ -381,27 +406,23 @@ class VulnerabilityFileMatcher:
             }
             
             # Collect results as they complete
-            scored_functions = []
             for future in as_completed(future_to_function):
                 func_name = future_to_function[future]
                 try:
                     function_name, score = future.result()
                     print(f"{function_name}: score={score}")
-                    scored_functions.append((function_name, score))
+                    if score >= 70:
+                        function_results.append(
+                            {
+                                "function": function_name,
+                                "score": score
+                            }
+                        )
                 except Exception as e:
                     print(f"Error scoring function {func_name}: {str(e)}")
-
-            # Find the highest score and keep only functions with that score
-            if scored_functions:
-                max_score = max(score for _, score in scored_functions)
-                function_results = [func_name for func_name, score in scored_functions if score == max_score]
-                print(f"Highest score: {max_score}, Functions: {function_results}")
-            else:
-                function_results = []
         
         print(f"Functions with score >= 70: {function_results}")
         return function_results
-        
 
 
     def _score_single_function(self, vulnerability_report: Dict[str, Any], content: str, file_path: str, function_name: str) -> Dict[str, Any]:
