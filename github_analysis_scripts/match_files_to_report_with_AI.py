@@ -494,7 +494,7 @@ class VulnerabilityFileMatcher:
 
         try:
             response = self.openai_client.chat.completions.create(
-                model="gpt-4o",  # Using full gpt-4o for better accuracy
+                model="gpt-4o-mini",  # Use full gpt-4o for better accuracy
                 messages=[
                     {
                         "role": "system", 
