@@ -402,7 +402,7 @@ def process_fix_url(fix_url: str, changed_files_only: bool) -> Set[str]:
 
         elif 'tree' in fix_url:
             print("Processing tree URL, retrieving smart contract files")
-            adjusted_url = normalize_commit_url(fix_url)
+            adjusted_url = tree_to_commit_url(fix_url)
             result = handle_commit_files_via_api(adjusted_url)
             if result and 'files' in result:
                 for file_info in result['files']:

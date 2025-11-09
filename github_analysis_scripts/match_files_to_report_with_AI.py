@@ -10,20 +10,19 @@ import json
 import re
 import os
 import requests
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
 from openai import OpenAI
-from dataclasses import dataclass
-
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 @dataclass
 class FileMatch:
     """Represents a file match with its score and metadata."""
     file_path: str
     blob_url: str
-    total_score: float
-    match_reasons: List[str]
     content_preview: str = ""
+    functions: Dict[str, str] = field(default_factory=dict)
 
 
 MIN_THRESHOLD = 70
@@ -38,6 +37,11 @@ class VulnerabilityFileMatcher:
         self.session = requests.Session()
         if github_token:
             self.session.headers.update({'Authorization': f'token {github_token}'})
+
+
+    # --------------------------------------------------------------------------
+    # ---------------------------- HELPER FUNCTIONS -------------------------
+    # --------------------------------------------------------------------------
 
     def construct_blob_from_ref(self, base_url: str, blob_url: str) -> str:
         """
@@ -130,157 +134,169 @@ class VulnerabilityFileMatcher:
             return blob_url.split('/')[-1]  # Fallback to filename
         except Exception:
             return blob_url.split('/')[-1]
-    
-    def chunk_file_content(self, content: str, max_chunk_size: int = 8000, overlap: int = 500) -> List[str]:
-        """Split file content into overlapping chunks."""
-        if len(content) <= max_chunk_size:
-            return [content]
-        
-        chunks = []
-        start = 0
-        
-        while start < len(content):
-            end = start + max_chunk_size
-            chunk = content[start:end]
-            chunks.append(chunk)
-            
-            # Move start forward, accounting for overlap
-            start = end - overlap
-            
-            # Break if we've covered the whole file
-            if end >= len(content):
+
+    # --------------------------------------------------------------------------
+    # ---------------------------- FUNCTION EXTRACTION -------------------------
+    # --------------------------------------------------------------------------
+    def remove_comments(self, code: str, filename: str = None, language: str = None) -> str:
+        """
+        Removes Solidity, JavaScript, Rust, Python, Go, and Move style comments.
+        Handles //, /* */, /** */ safely even across multiple lines.
+        """
+        # Remove block and doc comments (/* ... */ or /** ... */)
+        code = re.sub(r"/\*[\s\S]*?\*/", "", code)
+        # Remove single-line comments (// ...)
+        code = re.sub(r"//.*", "", code)
+        # Optionally handle Python or shell comments (# ...)
+        code = re.sub(r"(?m)^\s*#.*$", "", code)
+        return code
+
+    def extract_function_code(self, file_content: str, function_name: str, line_number: Optional[int] = None) -> str:
+        """
+        Extract a specific function or modifier from source code.
+        Supports Solidity, JS, Python, Rust, Move, Cairo, and Go.
+        """
+        if not file_content or not function_name:
+            return ""
+
+        # Remove comments first
+        clean_code = self.remove_comments(file_content)
+
+        patterns = [
+            # Solidity: function name(...) {
+            rf"\bfunction\s+{re.escape(function_name)}\s*\([^\)]*\)[^\{{;]*\{{",
+
+            # Solidity: modifier name(...) {
+            rf"\bmodifier\s+{re.escape(function_name)}\s*\([^\)]*\)[^\{{;]*\{{",
+
+            # Rust: fn name(...) {
+            rf"\bfn\s+{re.escape(function_name)}\s*\([^\)]*\)[^\{{;]*\{{",
+
+            # Kotlin: fun name(...) { or public fun name(...) {
+            rf"(?:public\s+)?fun\s+{re.escape(function_name)}\s*\([^\)]*\)[^\{{;]*\{{",
+
+            # Go: func name(...) { or func (receiver) name(...) {
+            rf"func\s+(?:\([^\)]*\)\s*)?{re.escape(function_name)}\s*\([^\)]*\)[^\{{;]*\{{",
+
+            # Python: def name(...):
+            rf"def\s+{re.escape(function_name)}\s*\([^\)]*\)\s*(?:->[^\:]+)?\s*\:",
+        ]
+
+        match = None
+        for pat in patterns:
+            m = re.search(pat, clean_code)
+            if m:
+                match = m
                 break
+
+        if not match:
+            if line_number:
+                lines = clean_code.splitlines()
+                start = max(line_number - 10, 0)
+                end = min(line_number + 40, len(lines))
+                return "\n".join(lines[start:end])
+            return ""
+
+        start_idx = match.start()
+        block_start = match.end() - 1
+
+        # Block-based (curly braces) languages
+        if match.group().strip().endswith("{"):
+            brace_count = 0
+            end_idx = None
+            for i, ch in enumerate(clean_code[block_start:], start=block_start):
+                if ch == "{":
+                    brace_count += 1
+                elif ch == "}":
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            return clean_code[start_idx:end_idx].strip() if end_idx else clean_code[start_idx:start_idx + 1000].strip()
+        else:
+            # Python-style indentation
+            lines = clean_code.splitlines()
+            line_index = clean_code[:match.start()].count("\n")
+            indent_match = re.match(r"(\s*)", lines[line_index])
+            base_indent = len(indent_match.group(1)) if indent_match else 0
+
+            block_lines = [lines[line_index]]
+            for next_line in lines[line_index + 1:]:
+                if not next_line.strip():
+                    block_lines.append(next_line)
+                    continue
+                indent = len(re.match(r"(\s*)", next_line).group(1))
+                if indent <= base_indent:
+                    break
+                block_lines.append(next_line)
+            return "\n".join(block_lines).strip()
+
+
+    def extract_all_functions(self, file_content: str) -> Dict[str, str]:
+        """
+        Extract all function and modifier names and their full code from a source file.
+        Returns a dictionary: {function_name: function_code}
+        """
+        if not file_content:
+            return {}
+
+        # Remove comments first
+        clean_code = self.remove_comments(file_content)
+
+        # Matches functions and modifiers (Solidity, JS, Rust, Move, Go, Cairo, Python)
+        patterns = [
+            r"\bfunction\s+([A-Za-z0-9_]+)\s*\([^\)]*\)[^\{;]*\{",
+            r"\bmodifier\s+([A-Za-z0-9_]+)\s*\([^\)]*\)[^\{;]*\{",
+            r"\bconstructor\s*\([^\)]*\)[^\{;]*\{",
+            r"\bfn\s+([A-Za-z0-9_]+)\s*\([^\)]*\)[^\{;]*\{",
+            r"(?:public\s+)?fun\s+([A-Za-z0-9_]+)\s*\([^\)]*\)[^\{;]*\{",
+            r"func\s+(?:\([^\)]*\)\s*)?([A-Za-z0-9_]+)\s*\([^\)]*\)[^\{;]*\{",
+            r"def\s+([A-Za-z0-9_]+)\s*\([^\)]*\)\s*(?:->[^\:]+)?\s*\:",
+        ]
+
+        functions = {}
+        for pat in patterns:
+            for m in re.finditer(pat, clean_code):
+                # Handle constructor (no name group)
+                if "constructor" in pat:
+                    name = "constructor"
+                else:
+                    # Get the last captured group (handles patterns with multiple groups)
+                    groups = [g for g in m.groups() if g and g.strip() and "public" not in g.lower()]
+                    if not groups:
+                        continue
+                    name = groups[-1]
+                
+                if name not in functions:
+                    code = self.extract_function_code(file_content, name)
+                    if code:  # Only add if we successfully extracted code
+                        functions[name] = code
+
+        return functions
+    
+    
+    # --------------------------------------------------------------------------
+    # ---------------------------- FUNCTION SCORING -------------------------
+    # --------------------------------------------------------------------------
+    def process_files(self, vulnerability_report: Dict[str, Any], blob_urls: List[str], max_workers: int = 5) -> List[FileMatch]:
+        """
+        Determines which functions are relevant to the bug using parallel processing
         
-        return chunks
-
-
-    def score_file_match(self, vulnerability_report: Dict[str, Any], file_content: str, file_path: str) -> Dict[str, Any]:
-        """Use GPT-4 to score how well a file matches the vulnerability report.
-        Handles large files by chunking and aggregating scores."""
-        
-        max_chunk_size = 8000
-        chunks = self.chunk_file_content(file_content, max_chunk_size)
-        
-        # If single chunk, process normally
-        if len(chunks) == 1:
-            return self._score_single_chunk(vulnerability_report, chunks[0], file_path, chunk_info="")
-        
-        # Process multiple chunks
-        print(f"  File too large, processing {len(chunks)} chunks...")
-        chunk_results = []
-        
-        for idx, chunk in enumerate(chunks, 1):
-            chunk_info = f" (chunk {idx}/{len(chunks)})"
-            result = self._score_single_chunk(vulnerability_report, chunk, file_path, chunk_info)
-            chunk_results.append(result)
-        
-        # Aggregate results: use max score and combine key matches
-        max_score_result = max(chunk_results, key=lambda x: x.get('score', 0))
-        all_key_matches = []
-        for result in chunk_results:
-            all_key_matches.extend(result.get('key_matches', []))
-        
-        # Remove duplicates while preserving order
-        unique_matches = []
-        seen = set()
-        for match in all_key_matches:
-            if match not in seen:
-                unique_matches.append(match)
-                seen.add(match)
-        
-        return {
-            "score": max_score_result.get('score', 0),
-            "reasoning": f"Max score from {len(chunks)} chunks: {max_score_result.get('reasoning', 'N/A')}",
-            "confidence": max_score_result.get('confidence', 'low'),
-            "key_matches": unique_matches
-        }
-
-
-    def _score_single_chunk(self, vulnerability_report: Dict[str, Any], content: str, file_path: str, chunk_info: str = "") -> Dict[str, Any]:
-        """Score a single chunk of file content."""
-        
-        prompt = f"""
-    You are a security expert analyzing whether a source code file matches a vulnerability report.
-
-    VULNERABILITY REPORT:
-    Title: {vulnerability_report.get('title', 'N/A')}
-    Description: {vulnerability_report.get('description', 'N/A')}
-    Recommendation: {vulnerability_report.get('recommendation', 'N/A')}
-    Broken Code Snippets: {vulnerability_report.get('broken_code_snippets', [])}
-    Source Code URL: {vulnerability_report.get('source_code_url', 'N/A')}
-    Fix Commit URL: {vulnerability_report.get('fix_commit_url', 'N/A')}
-    Files: {vulnerability_report.get('files', 'N/A')}
-
-    FILE TO ANALYZE:
-    File Path: {file_path}{chunk_info}
-    File Content:
-    {content}
-
-    TASK:
-    Score this file from 0-100 based on how likely it contains the vulnerability described:
-    - 0: Completely irrelevant
-    - 1-30: Low relevance (mentions some related concepts but unlikely to be the vulnerable file)
-    - 31-60: Medium relevance (contains related functionality but may not be the exact vulnerable code)
-    - 61-89: High relevance (strong indicators this contains the vulnerability)
-    - 90-100: Very high relevance (almost certainly contains the exact vulnerability)
-
-    Consider:
-    1. Function names mentioned in the vulnerability
-    2. Code patterns described in the vulnerability
-    3. Variable names and logic described
-    4. Overall context and purpose of the file
-
-    Respond in JSON format:
-    {{
-        "score": <number 0-100>,
-        "reasoning": "<brief explanation of your scoring>",
-        "confidence": "<high|medium|low>",
-        "key_matches": ["<list of specific matches found>"]
-    }}
-    """
-
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=500
-            )
+        Args:
+            vulnerability_report: Dictionary containing vulnerability report data
+            blob_urls: Blob urls of files that will be checked
+            max_workers: Maximum number of parallel workers (default: 5)
             
-            result_text = response.choices[0].message.content
-            # Try to parse JSON from the response
-            try:
-                result = json.loads(result_text)
-                return result
-            except json.JSONDecodeError:
-                # Fallback: extract score with regex if JSON parsing fails
-                score_match = re.search(r'"score":\s*(\d+)', result_text)
-                score = int(score_match.group(1)) if score_match else 0
-                return {
-                    "score": score,
-                    "reasoning": "GPT-4o-mini response parsing failed",
-                    "confidence": "low",
-                    "key_matches": []
-                }
-        
-        except Exception as e:
-            print(f"Error scoring file {file_path}{chunk_info}: {e}")
-            return {
-                "score": 0,
-                "reasoning": f"API error: {e}",
-                "confidence": "low",
-                "key_matches": []
-            }
-
-
-    def process_files(self, vulnerability_report: Dict[str, Any], blob_urls: List[str]) -> List[FileMatch]:
-        """Process all files and return sorted matches."""
+        Returns:
+            list: List of FileMatch objects containing source url and relevant functions
+        """
         matches = []
         
-        print(f"Processing {len(blob_urls)} files...")
+        print(f"Processing {len(blob_urls)} files in parallel (max {max_workers} workers)...")
         
-        for i, blob_url in enumerate(blob_urls, 1):
-            print(f"Processing file {i}/{len(blob_urls)}: {blob_url}")
+        def process_single_file(blob_url: str, index: int) -> Tuple[int, FileMatch]:
+            """Process a single file and return its match."""
+            print(f"Processing file {index}/{len(blob_urls)}: {blob_url}")
             
             # Extract file path
             file_path = self.extract_file_path_from_url(blob_url)
@@ -288,258 +304,233 @@ class VulnerabilityFileMatcher:
             # Fetch file content
             content = self.fetch_file_content(blob_url)
             if not content:
-                print(f"  Skipped (could not fetch content)")
-                continue
+                print(f"  Skipped (could not fetch content): {blob_url}")
+                return None
             
             # Score the match (now handles chunking internally)
-            score_result = self.score_file_match(vulnerability_report, content, file_path)
+            function_results = self.score_file_match(vulnerability_report, content, file_path)
             
             # Create match object
+            if not function_results:
+                print(f"No matching functions found in {blob_url}")
+                return None
+            
             match = FileMatch(
                 file_path=file_path,
                 blob_url=blob_url,
-                total_score=score_result.get('score', 0),
-                match_reasons=score_result.get('key_matches', []),
-                content_preview=content[:200] + "..." if len(content) > 200 else content
+                functions=function_results
             )
             
-            matches.append(match)
-            print(f"  Score: {match.total_score}/100 - {score_result.get('reasoning', 'No reasoning')}")
-
-            if match.total_score >= 95:
-                print(f"  Found high-confidence match (score >= 95). Returning immediately.")
-                return [match]
+            return (index, match)
         
-        # Sort by score (highest first)
-        matches.sort(key=lambda x: x.total_score, reverse=True)
-        high_confidence_matches = [match for match in matches if match.total_score >= MIN_THRESHOLD]
-        return high_confidence_matches
-
-    def score_function_matches(self, vulnerability_report: Dict[str, Any], blob_url: str) -> Dict[str, Any]:
-        """Use GPT-4 to extract functions from code and rank them by vulnerability relevance."""
-        
-        file_content = self.fetch_file_content(blob_url)
-        max_content_length = 8000
-        
-        # Check if chunking is needed
-        if len(file_content) <= max_content_length:
-            # Process single chunk
-            return self._analyze_code_chunk(
-                vulnerability_report, 
-                file_content, 
-                blob_url,
-                chunk_index=0,
-                total_chunks=1
-            )
-        
-        # Process large file in chunks
-        return self._analyze_large_file_in_chunks(
-            vulnerability_report,
-            file_content,
-            blob_url,
-            max_content_length
-        )
-
-    def _analyze_large_file_in_chunks(
-        self, 
-        vulnerability_report: Dict[str, Any], 
-        file_content: str, 
-        blob_url: str,
-        max_chunk_size: int
-    ) -> Dict[str, Any]:
-        """Analyze a large file by splitting it into chunks and merging results."""
-        
-        # Split content into chunks with overlap to avoid splitting functions
-        overlap = 500  # Character overlap between chunks to catch split functions
-        chunks = []
-        start = 0
-        
-        while start < len(file_content):
-            end = start + max_chunk_size
+        # Process files in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_url = {
+                executor.submit(process_single_file, blob_url, i): (i, blob_url) 
+                for i, blob_url in enumerate(blob_urls, 1)
+            }
             
-            # If not the last chunk, try to break at a logical boundary
-            if end < len(file_content):
-                # Look for function/class boundaries (common patterns)
-                chunk_content = file_content[start:end]
-                
-                # Try to find a good break point (end of function, class, or blank line)
-                last_newlines = chunk_content.rfind('\n\n')
-                last_def = chunk_content.rfind('\ndef ')
-                last_class = chunk_content.rfind('\nclass ')
-                
-                # Use the latest boundary found
-                break_point = max(last_newlines, last_def, last_class)
-                
-                if break_point > max_chunk_size * 0.7:  # Only use if in latter 30% of chunk
-                    end = start + break_point
+            # Collect results as they complete
+            results = []
+            for future in as_completed(future_to_url):
+                try:
+                    result = future.result()
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    index, blob_url = future_to_url[future]
+                    print(f"Error processing {blob_url}: {str(e)}")
             
-            chunks.append({
-                'content': file_content[start:end],
-                'start_pos': start,
-                'end_pos': min(end, len(file_content))
-            })
+            # Sort by original index to maintain order
+            results.sort(key=lambda x: x[0])
+            matches = [match for _, match in results]
+        
+        return matches
+    
+    def score_file_match(self, vulnerability_report: Dict[str, Any], file_content: str, file_path: str, max_workers: int = 10) -> List[str]:
+        """Use GPT-4 to score how well functions match the vulnerability report.
+        Handles scoring in parallel for better performance.
+        
+        Args:
+            vulnerability_report: Dictionary containing vulnerability report data
+            file_content: Content of the file to analyze
+            file_path: Path to the file
+            max_workers: Maximum number of parallel workers for function scoring (default: 10)
             
-            # Move to next chunk with overlap
-            start = end - overlap if end < len(file_content) else end
+        Returns:
+            list: List of function names with score >= 90
+        """
         
-        print(f"Analyzing {blob_url} in {len(chunks)} chunks...")
+        all_functions = self.extract_all_functions(file_content)
+        function_results = []
         
-        # Analyze each chunk
-        all_functions = []
-        chunk_summaries = []
+        def score_single_function_wrapper(function_name: str, function_code: str) -> Tuple[str, int]:
+            """Wrapper to score a single function and return name and score."""
+            print(f"Scoring function: {function_name}")
+            result = self._score_single_function(vulnerability_report, function_code, file_path, function_name)
+            score = result.get('score', 0)
+            return (function_name, score)
         
-        for i, chunk in enumerate(chunks):
-            result = self._analyze_code_chunk(
-                vulnerability_report,
-                chunk['content'],
-                blob_url,
-                chunk_index=i,
-                total_chunks=len(chunks),
-                chunk_start=chunk['start_pos']
-            )
-
-            print(f"Result: {result}")
+        # Process functions in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all function scoring tasks
+            future_to_function = {
+                executor.submit(score_single_function_wrapper, func_name, func_code): func_name
+                for func_name, func_code in all_functions.items()
+            }
             
-            if 'functions' in result:
-                all_functions.extend(result['functions'])
-            
-            if 'file_summary' in result:
-                chunk_summaries.append(f"Chunk {i+1}: {result['file_summary']}")
+            # Collect results as they complete
+            scored_functions = []
+            for future in as_completed(future_to_function):
+                func_name = future_to_function[future]
+                try:
+                    function_name, score = future.result()
+                    print(f"{function_name}: score={score}")
+                    scored_functions.append((function_name, score))
+                except Exception as e:
+                    print(f"Error scoring function {func_name}: {str(e)}")
+
+            # Find the highest score and keep only functions with that score
+            if scored_functions:
+                max_score = max(score for _, score in scored_functions)
+                function_results = [func_name for func_name, score in scored_functions if score == max_score]
+                print(f"Highest score: {max_score}, Functions: {function_results}")
+            else:
+                function_results = []
         
-        # Deduplicate functions by name (keep highest score)
-        unique_functions = {}
-        for func in all_functions:
-            func_name = func.get('name', 'unknown')
-            if func_name not in unique_functions or func.get('score', 0) > unique_functions[func_name].get('score', 0):
-                unique_functions[func_name] = func
+        print(f"Functions with score >= 70: {function_results}")
+        return function_results
         
-        # Sort by score
-        sorted_functions = sorted(
-            unique_functions.values(),
-            key=lambda x: x.get('score', 0),
-            reverse=True
-        )
+
+
+    def _score_single_function(self, vulnerability_report: Dict[str, Any], content: str, file_path: str, function_name: str) -> Dict[str, Any]:
+        """Score a single chunk of file content."""
+
+        print(f"Analyzing {function_name}")
+
+        # Extract key vulnerability indicators
+        vuln_title = vulnerability_report.get('title', '')
+        vuln_description = vulnerability_report.get('description', '')
+        vuln_recommendation = vulnerability_report.get('recommendation', '')
+        severity = vulnerability_report.get('severity', 'Unknown')
+        category = vulnerability_report.get('category', 'Unknown')
+        files = vulnerability_report.get('files', 'Unknown')
         
-        return {
-            "functions": sorted_functions,
-            "file_summary": f"Large file analyzed in {len(chunks)} chunks. " + "; ".join(chunk_summaries[:3]),
-            "total_chunks": len(chunks),
-            "total_functions_found": len(sorted_functions)
-        }
+        # Combine most relevant fields (truncate intelligently)
+        vuln_context = f"""
+        Title: {vuln_title[:500]}
+        Severity: {severity}
+        Category: {category}
+        Description: {vuln_description[:1500]}
+        Recommendation: {vuln_recommendation[:1000]}
+        Files: {files}
+        """
 
-    def _analyze_code_chunk(
-        self,
-        vulnerability_report: Dict[str, Any],
-        file_content: str,
-        blob_url: str,
-        chunk_index: int = 0,
-        total_chunks: int = 1,
-        chunk_start: int = 0
-    ) -> Dict[str, Any]:
-        """Analyze a single chunk of code."""
-        
-        chunk_info = f" (Chunk {chunk_index + 1} of {total_chunks})" if total_chunks > 1 else ""
-        
-        prompt = f"""
-    You are a security expert analyzing source code to identify which specific functions are most relevant to a vulnerability report.
+        prompt = f"""You are a Web3 security expert analyzing smart contract code for vulnerabilities.
 
-    VULNERABILITY REPORT:
-    Title: {vulnerability_report.get('title', 'N/A')}
-    Description: {vulnerability_report.get('description', 'N/A')}
-    Recommendation: {vulnerability_report.get('recommendation', 'N/A')}
-    Broken Code Snippets: {vulnerability_report.get('broken_code_snippets', [])}
-    Files: {vulnerability_report.get('files', 'N/A')}
+        VULNERABILITY REPORT:
+        {vuln_context}
 
-    FILE TO ANALYZE{chunk_info}:
-    {file_content}
+        CODE TO ANALYZE:
+        File: {file_path}
+        Function: {function_name}
+        ```
+        {content[:3000]}  
+        ```
 
-    TASK:
-    1. Extract all function/method definitions from this code
-    2. For each function, score it from 0-100 based on how likely it contains or relates to the vulnerability:
-    - 0: Completely irrelevant
-    - 1-30: Low relevance (mentions related concepts but unlikely to be vulnerable)
-    - 31-60: Medium relevance (contains related functionality)
-    - 61-89: High relevance (strong indicators of vulnerability)
-    - 90-100: Very high relevance (almost certainly the vulnerable function)
+        ANALYSIS TASK:
+        Determine if this function contains or is directly related to the vulnerability described above.
 
-    3. Rank functions by their relevance scores (highest first)
+        SCORING CRITERIA:
+        - 90-100: Function name, variable names, and logic patterns DIRECTLY match the vulnerability description
+        - 70-89: Function contains the problematic code pattern described, with matching context
+        - 50-69: Function has related functionality and some matching elements (variables/logic)
+        - 30-49: Function is in the same contract/file area but doesn't match specific patterns
+        - 10-29: Function has tangential relevance (similar domain but different purpose)
+        - 0-9: Completely unrelated to the vulnerability
 
-    Consider:
-    - Function names mentioned in the vulnerability
-    - Code patterns and logic described in the vulnerability
-    - Security-sensitive operations (authentication, authorization, input validation, etc.)
-    - Variable names and data flow
-    - API endpoints or route handlers mentioned
+        FOCUS ON:
+        1. Exact function names mentioned in the report (e.g., "_withdrawInOrder", "getExchangeRate")
+        2. Specific variable names mentioned (e.g., "exchangeRate", "withdrawableBalance", "totalWithdrawableBalanceInAssets")
+        3. Problematic code patterns (e.g., "division before multiplication", "rounding errors")
+        4. Mathematical operations and their order
+        5. Contract/file context matches
 
-    Respond ONLY with valid JSON, no markdown formatting or code blocks. Use this exact format:
-    {{
-        "functions": [
-            {{
-                "name": "<function_name>",
-                "line_number": <approximate line number or null>,
-                "score": <number 0-100>,
-                "reasoning": "<brief explanation>",
-                "confidence": "<high|medium|low>",
-                "key_indicators": ["<specific matches or concerns>"]
-            }}
-        ],
-        "file_summary": "<brief summary of this code section's relevance>"
-    }}
+        IMPORTANT:
+        - Be STRICT: Only score 70+ if you find SPECIFIC matches to the vulnerability
+        - Generic functions that happen to be in the same file should score 30-50 max
+        - If the function name doesn't match AND the logic doesn't match, score should be low (0-30)
 
-    Order the functions array by score (highest first). Include all functions found, prioritizing those with higher relevance scores.
-    """
+        Respond ONLY with valid JSON (no markdown, no code blocks):
+        {{
+            "name": "{function_name}",
+            "score": <number 0-100>,
+            "reasoning": "<1-2 sentence explanation focusing on specific matches or mismatches>",
+            "confidence": "<high|medium|low>",
+            "key_matches": ["<specific function names, variables, or patterns found>"]
+        }}"""
 
         try:
             response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=1500,
-                response_format={"type": "json_object"}
+                model="gpt-4o",  # Using full gpt-4o for better accuracy
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "You are a smart contract security expert. Analyze code precisely and return only valid JSON responses."
+                    },
+                    {
+                        "role": "user", 
+                        "content": prompt
+                    }
+                ],
+                temperature=0.0,  # More deterministic
+                max_tokens=600,
+                response_format={"type": "json_object"}  # Force JSON output
             )
             
             result_text = response.choices[0].message.content.strip()
             
-            # Multiple parsing strategies
-            result = self._parse_gpt_response(result_text)
+            # Parse JSON response
+            result = json.loads(result_text)
             
-            if result is None:
-                return {
-                    "functions": [],
-                    "file_summary": "Failed to parse response after multiple attempts",
-                    "error": "All parsing strategies failed",
-                    "raw_response": result_text[:500]
-                }
+            # Validate required fields
+            if "score" not in result:
+                raise ValueError("Response missing 'score' field")
             
-            # Adjust line numbers based on chunk position
-            if "functions" in result and chunk_start > 0:
-                for func in result["functions"]:
-                    if func.get("line_number") is not None:
-                        lines_before = file_content[:chunk_start].count('\n')
-                        func["line_number"] = func["line_number"] + lines_before
+            # Ensure score is in valid range
+            result["score"] = max(0, min(100, int(result["score"])))
             
-            # Ensure functions are sorted by score
-            if "functions" in result:
-                result["functions"] = sorted(
-                    result["functions"],
-                    key=lambda x: x.get("score", 0),
-                    reverse=True
-                )
-            
-            # Ensure required fields exist
-            if "functions" not in result:
-                result["functions"] = []
-            if "file_summary" not in result:
-                result["file_summary"] = "No summary provided"
+            # Add function name if missing
+            if "name" not in result:
+                result["name"] = function_name
+                
+            # Ensure all required fields exist
+            result.setdefault("reasoning", "No reasoning provided")
+            result.setdefault("confidence", "medium")
+            result.setdefault("key_matches", [])
             
             return result
         
-        except Exception as e:
-            print(f"Error analyzing chunk in {blob_url}: {e}")
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing error for {file_path}/{function_name}: {e}")
+            print(f"Response was: {result_text[:200]}")
             return {
-                "functions": [],
-                "file_summary": f"API error: {e}",
-                "error": str(e)
+                "name": function_name,
+                "score": 0,
+                "reasoning": "Failed to parse GPT response as JSON",
+                "confidence": "low",
+                "key_matches": []
+            }
+        
+        except Exception as e:
+            print(f"Error scoring function {function_name} in {file_path}: {e}")
+            return {
+                "name": function_name,
+                "score": 0,
+                "reasoning": f"API error: {str(e)[:100]}",
+                "confidence": "low",
+                "key_matches": []
             }
 
     def _parse_gpt_response(self, text: str) -> Dict[str, Any]:

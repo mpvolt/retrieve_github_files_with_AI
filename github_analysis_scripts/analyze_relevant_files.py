@@ -535,32 +535,40 @@ def handle_source_blob_urls(report, fields):
         matches = matcher.process_files(fields, relevant_files)
 
         if matches:
-            report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
+            context = []
+            for m in matches:
+                source = m.blob_url
+                #Get fixed_github_code_blob from fix_commit_url if we can
+                if report.get("fix_commit_url"):
+                    fixed_code_blobs = []
+                    seen_fixed_blobs = set()
+                    for match in matches or []:
+                        try:
+                            fix_commit_url = report.get("fix_commit_url", "")
+                    
+                            # Handle both string and list cases
+                            fix_commit_urls = [fix_commit_url] if isinstance(fix_commit_url, str) else fix_commit_url
+                            
+                            for url in fix_commit_urls:
+                                fixed_blob = matcher.construct_blob_from_ref(url, source)
+                                
+                                # Only add if not already seen
+                                if fixed_blob not in seen_fixed_blobs:
+                                    fixed_code_blobs.append(fixed_blob)
+                                    seen_fixed_blobs.add(fixed_blob)
+                                
+                                break  # Stop after finding first valid match
+                        except Exception as e:
+                            print(f"[Warning] Error handling match {match}: {e}")
+                    fix = list(set(fixed_code_blobs))  # Remove any remaining duplicates
+                context.append({
+                    "source": source,
+                    "fix": fix,
+                    "functions": m.functions
+                })
+
+            report["context"] = context
             
-            #Get fixed_github_code_blob from fix_commit_url if we can
-            if report.get("fix_commit_url"):
-                fixed_code_blobs = []
-                seen_fixed_blobs = set()
-                for match in matches or []:
-                    try:
-                        fix_commit_url = report.get("fix_commit_url", "")
-                
-                        # Handle both string and list cases
-                        fix_commit_urls = [fix_commit_url] if isinstance(fix_commit_url, str) else fix_commit_url
-                        
-                        for url in fix_commit_urls:
-                            fixed_blob = matcher.construct_blob_from_ref(url, match.blob_url)
-                            
-                            # Only add if not already seen
-                            if fixed_blob not in seen_fixed_blobs:
-                                fixed_code_blobs.append(fixed_blob)
-                                seen_fixed_blobs.add(fixed_blob)
-                            
-                            break  # Stop after finding first valid match
-                    except Exception as e:
-                        print(f"[Warning] Error handling match {match}: {e}")
-                report["fixed_github_code_blob"] = list(set(fixed_code_blobs))  # Remove any remaining duplicates
-        
 
 def handle_fix_commit_blobs(report, fields):
     """Extract fixed blobs from fix_commit_url if present."""
@@ -612,12 +620,9 @@ def handle_ai_strategy(report, fields, relevant_files, strategy):
 
         elif ai_strategy == "source_code":
             print("Using source code strategy")
-            matches = attempt_source_code_strategy(report, fields, matcher)
+            matches = attempt_source_code_strategy(report, fields, matcher, relevant_files)
             
-            # If no matches, try fix commit strategy
-            if not matches:
-                print("[Info] No matches with source_code strategy, trying fix_commit strategy...")
-                matches = process_fix_commit_strategy(report, fields, relevant_files, matcher)
+            
 
         else:
             print(f"[Info] No recognized AI strategy: {ai_strategy}")
@@ -633,96 +638,73 @@ def handle_ai_strategy(report, fields, relevant_files, strategy):
 def process_fix_commit_strategy(report, fields, relevant_files, matcher):
     """Process files using the fix commit strategy."""
     matches = matcher.process_files(fields, relevant_files)
-
+    seen_match_urls = set()
+    fix_commit_urls = report.get("fix_commit_url", [])
+    # If no initial matches, search entire repo
     if not matches:
         print("[Info] No matches found initially, looking at other files in the repo...")
         matches = []
-        seen_urls = set()
         
         try:
-            fix_commit_url = report.get("fix_commit_url")
-            if isinstance(fix_commit_url, str):
-                fix_commit_urls = [fix_commit_url]
-            else:
-                fix_commit_urls = fix_commit_url or []
+            if isinstance(fix_commit_urls, str):
+                fix_commit_urls = [fix_commit_urls]
             
             for url in fix_commit_urls:
                 relevant_files = process_fix_url(url, False)
                 for fm in matcher.process_files(fields, relevant_files):
-                    if fm.blob_url not in seen_urls:
+                    if fm.blob_url not in seen_match_urls:
                         matches.append(fm)
-                        seen_urls.add(fm.blob_url)
+                        seen_match_urls.add(fm.blob_url)
         except Exception as e:
             print(f"[Error] Failed processing fix_commit_url: {e}")
             report["fix_commit_error"] = str(e)
-
-    fixed_code_blobs = []
-    seen_match_urls = set()
-    seen_fixed_blobs = set()
-
-    for match in matches or []:
+    
+    # Create mapping from afflicted -> fixed blob URLs
+    afflicted_to_fixed = {}  # Maps afflicted blob URL to fixed blob URL
+    context = []
+    for match in matches:
+        afflicted_url = match.blob_url  # Save the afflicted URL before modification
+        fixed_blob = ""
+        # Skip duplicates
+        if afflicted_url in afflicted_to_fixed:
+            continue
+            
+        # Find corresponding fixed version
         try:
-            fix_commit_url = report.get("fix_commit_url", "")
-            
-            # Handle both string and list cases
-            fix_commit_urls = [fix_commit_url] if isinstance(fix_commit_url, str) else fix_commit_url
-            
             for url in fix_commit_urls:
                 if any(k in url for k in ["tree", "compare", "commit", "pull"]):
-                    original_blob_url = find_file_before_change(url, match.blob_url)
+                    original_blob_url = find_file_before_change(url, afflicted_url)
                     if original_blob_url and original_blob_url != "NEW FILE":
-                        match.blob_url = original_blob_url
                         fixed_blob = matcher.construct_blob_from_ref(url, original_blob_url)
-                        
-                        # Only add if not already seen
-                        if fixed_blob not in seen_fixed_blobs:
-                            fixed_code_blobs.append(fixed_blob)
-                            seen_fixed_blobs.add(fixed_blob)
-                        
-                        break  # Stop after finding first valid match
+                        break
+                
         except Exception as e:
             print(f"[Warning] Error handling match {match}: {e}")
+            afflicted_to_fixed[afflicted_url] = None
 
-    if not report.get("afflicted_github_code_blob"):
-        # Remove duplicates from matches using blob_url as key
-        unique_matches = []
-        for m in matches or []:
-            if m.blob_url not in seen_match_urls:
-                unique_matches.append(m)
-                seen_match_urls.add(m.blob_url)
-        
-        report["afflicted_github_code_blob"] = [m.blob_url for m in unique_matches]
-        report["fixed_github_code_blob"] = list(set(fixed_code_blobs))  # Remove any remaining duplicates
-        
+        context.append({
+                "source": afflicted_url,
+                "fix": fixed_blob,
+                "functions": match.functions
+            })
+    
     return matches
 
 
-def attempt_source_code_strategy(report, fields, matcher):
+def attempt_source_code_strategy(report, fields, matcher, relevant_files):
     """Process files using the source code strategy."""
     try:
-        source_code_url = report.get("source_code_url")
-        if not source_code_url:
-            print("[Info] No source_code_url available for fallback")
-            return []
-        
-        # Get relevant files from source URL
-        if isinstance(source_code_url, str):
-            source_urls = [source_code_url]
-        else:
-            source_urls = source_code_url or []
-        
-        relevant_files = []
-        for url in source_urls:
-            files = process_source_url(url)
-            if files:
-                relevant_files.extend(files)
-        
-        if not relevant_files:
-            print("[Info] No relevant files found from source_code_url")
-            return []
-        
         matches = matcher.process_files(fields, relevant_files)
-        report["afflicted_github_code_blob"] = [m.blob_url for m in matches] if matches else []
+        if not matches:
+            return []
+        else:
+            context = []
+            for m in matches:
+                context.append({
+                    "source":m.blob_url,
+                    "functions":m.functions
+                })
+            report["context"] = context
         return matches
         
     except Exception as e:
@@ -730,129 +712,30 @@ def attempt_source_code_strategy(report, fields, matcher):
         report["source_code_error"] = str(e)
         return []
 
+def assign_bug_type(report):
+    bug_type = ""
+    if report.get("context"):
+        sources = set() 
+        for obj in report.get("context"):
+            if obj.get("source"):
+                sources.add("source")
+                
+        if len(sources) > 1:
+            bug_type = "multi-file"
+        else:
+            bug_type = "single-file"
 
-def determine_relevant_functions(report):
-    """
-    Determines relevant functions from a vulnerability report with error handling.
-    
-    Args:
-        report: Dictionary containing vulnerability report data
-        
-    Returns:
-        dict: The report with added context, or None if critical errors occur
-    """
-    try:
-        # Validate report input
-        if not report or not isinstance(report, dict):
-            print("Error: Invalid report - must be a non-empty dictionary")
-            return None
-        
-        # Extract fields with error handling
-        try:
-            fields = extract_report_fields(report, 0)
-            if not fields:
-                print("Warning: No fields extracted from report")
-                return report
-        except Exception as e:
-            print(f"Error extracting report fields: {e}")
-            return report
-        
-        # Initialize matcher with error handling
-        try:
-            matcher = VulnerabilityFileMatcher(OPENAI_API_KEY, GITHUB_API_KEY)
-        except Exception as e:
-            print(f"Error initializing VulnerabilityFileMatcher: {e}")
-            return report
-        
-        context = []
-        
-        # Process GitHub code blobs
-        blobs = report.get("afflicted_github_code_blob", [])
-        if blobs and not isinstance(blobs, list):
-            print("Warning: afflicted_github_code_blob is not a list, skipping")
-            blobs = []
-        
-        for blob in blobs:
-            try:
-                result = matcher.score_function_matches(fields, blob)
-                
-                if not result or not isinstance(result, dict):
-                    print(f"Warning: Invalid result for blob, skipping")
-                    continue
-                
-                print(f"Found {result.get('total_functions_found', 0)} functions")
-                print(f"Analyzed in {result.get('total_chunks', 1)} chunks")
-                
-                # Extract high-risk functions safely
-                functions = result.get("functions", [])
-                if not isinstance(functions, list):
-                    print("Warning: Functions is not a list, skipping")
-                    continue
-                
-                high_risk_functions = [
-                    func for func in functions 
-                    if isinstance(func, dict) and func.get('score', 0) > 85
-                ]
-                
-                if high_risk_functions:
-                    context.append({
-                        "source": blob,
-                        "functions": high_risk_functions
-                    })
-                    
-            except Exception as e:
-                print(f"Error processing blob: {e}")
-                continue
-        
-        # Process afflicted source code
-        afflicted_code = report.get("afflicted_source_code")
-        if afflicted_code:
-            try:
-                result = matcher._analyze_code_chunk(
-                    fields, 
-                    afflicted_code, 
-                    "", 
-                    0, 
-                    1
-                )
-                
-                if result and isinstance(result, dict):
-                    functions = result.get("functions", [])
-                    if isinstance(functions, list):
-                        high_risk_functions = [
-                            func for func in functions 
-                            if isinstance(func, dict) and func.get('score', 0) > 85
-                        ]
-                        
-                        if high_risk_functions:
-                            # Note: Using afflicted_code as source since blob isn't defined here
-                            context.append({
-                                "source": "afflicted_source_code",
-                                "functions": high_risk_functions
-                            })
-                else:
-                    print("Warning: Invalid result from afflicted_source_code analysis")
-                    
-            except Exception as e:
-                print(f"Error processing afflicted_source_code: {e}")
-        
-        # Add context to report
-        report["context"] = context
-        return report
-        
-    except Exception as e:
-        print(f"Critical error in determine_relevant_functions: {e}")
-        return None
+    return bug_type
 
-def assign_functions_and_languages(report):
+
+def assign_languages(report):
     """Determine relevant functions and detect languages from afflicted blobs."""
 
     languages = set()
-    determine_relevant_functions(report)
-    for github_blob in report.get("afflicted_github_code_blob"): 
-        print(github_blob)       
+    for obj in report.get("context"): 
+        source = obj.get("source")      
         # Detect language from extension
-        ext = '.' + github_blob.split('.')[-1].lower()
+        ext = '.' + source.split('.')[-1].lower()
         lang = SMART_CONTRACT_LANGUAGES.get(ext)
         languages.add(lang)
 
@@ -870,13 +753,7 @@ def process_single_report(report, i, processed_urls, json_file):
     print(f"\nProcessing report: {fields['title']}")
 
     # Case 0: already processed, don't need to do anything
-    if report.get("afflicted_github_code_blob") and report.get("context"):
-        return report
-
-    # Case 1: already has afflicted blobs → just get functions/languages, no further processing
-    if report.get("afflicted_github_code_blob") and not report.get("context"):
-        print("Case 1: already has afflicted blobs, but no function context")
-        assign_functions_and_languages(report)
+    if report.get("context"):
         return report
 
     # Case 2: source code url is already a blob -> needs special processing
@@ -886,21 +763,22 @@ def process_single_report(report, i, processed_urls, json_file):
     handle_fix_commit_blobs(report, fields)
 
     # Case 4 (Normal Case): Process source/fix url using AI-based matching strategy
-    if not report.get("afflicted_github_code_blob"):
+    if not report.get("context"):
         relevant_files, strategy = determine_relevant_files(report, i, processed_urls, json_file)
         handle_ai_strategy(report, fields, relevant_files, strategy)
 
-    # Case 5: If we have a github blob, extract relevant function names + coding language used
-    if not report.get("context") and report.get("afflicted_github_code_blob"):
-        assign_functions_and_languages(report)
-
-    # Case 6: No source/fix links, only afflicted_source_code
-    if not report.get("afflicted_github_code_blob") and report.get("afflicted_source_code"):
-        determine_relevant_functions(report)
-
-    if not report.get("type") and report.get("title") or report.get("description"):
+    # Add vulnerability type
+    if not report.get("category") and report.get("title") or report.get("description"):
         result = get_vulnerability_type(report)    
-        report['type'] = result.get("type", "unknown")
+        report['category'] = result.get("type", "unknown")
+
+    # Add Language
+    if not report.get("language") and report.get("context"):
+        assign_languages(report)
+
+    if report.get("context"):
+        result = assign_bug_type(report)
+        report["vulnerability_type"] = result
 
     return report
 
@@ -922,34 +800,36 @@ def analyze_relevant_files(json_file):
         # Process report in-place
         report = process_single_report(report, i, processed_urls, json_file)
 
-        if not report["afflicted_github_code_blob"]:
+        print(report)
+
+        if not report.get("context"):
             continue
 
-        report_title = report.get('title', f'Report_{i+1}')
-        report_id = report.get('id', f'ID_{i+1}')
+        # report_title = report.get('title', f'Report_{i+1}')
+        # report_id = report.get('id', f'ID_{i+1}')
 
-        all_matches[report_title] = report["afflicted_github_code_blob"]
+        # all_matches[report_title] = report["context"]
 
-        # Add to summary using first blob for high-confidence
-        summary_result = create_summary_result(
-            report_id, report_title, report, report["afflicted_github_code_blob"]
-        )
-        summary_results.append(summary_result)
+        # # Add to summary using first blob for high-confidence
+        # summary_result = create_summary_result(
+        #     report_id, report_title, report, report["afflicted_github_code_blob"]
+        # )
+        # summary_results.append(summary_result)
 
     # Save updated JSON
     save_updated_reports(json_file, reports)
 
     # Print comprehensive summary
-    if summary_results:
-        print_summary_header()
-        for result in summary_results:
-            print_summary_row(result)
-        print_statistics(summary_results)
-        print_severity_breakdown(summary_results)
-        print_blob_assignment_summary(reports)
-        #print_final_summary(all_matches)
+    # if summary_results:
+    #     print_summary_header()
+    #     for result in summary_results:
+    #         print_summary_row(result)
+    #     print_statistics(summary_results)
+    #     print_severity_breakdown(summary_results)
+    #     print_blob_assignment_summary(reports)
+    #     #print_final_summary(all_matches)
 
-    return all_matches
+    # return all_matches
 
 def main():
     import argparse
